@@ -5,15 +5,11 @@ A command line utility for Costpoint ⏱
 ## Installation
 
 ```shellsession
-$ npm install --global costpoint
+$ npx . --help
 $ export COSTPOINT_USERNAME="01234.FIRST.LAST"
-$ export COSTPOINT_PASSWORD="**********"
-$ export COSTPOINT_SYSTEM="SYSTEMCONFIG"
-$ export COSTPOINT_URL="https://example.costpointfoundations.com/cpweb/cploginform.htm"
+$ export COSTPOINT_PASSWORD='**********'
+$ export COSTPOINT_URL="https://example.costpointfoundations.com/cpweb/cploginform.htm?system=..."
 ```
-
-> Note: Export the environment variables in `.profile` to persist the environment variables between sessions.
-> Make sure to escape the exported environment variables correctly.
 
 ## Usage
 
