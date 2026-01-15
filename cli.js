@@ -4,6 +4,7 @@
 const chalk = require("chalk");
 const costpoint = require("./costpoint");
 const { program } = require("commander");
+const readline = require("readline");
 
 require("dotenv").config();
 
@@ -39,6 +40,41 @@ program
     cp.display();
     await cp.close();
   });
+
+program
+  .command("sign")
+  .description("sign timesheet")
+  .option("-y, --yes", "skip confirmation prompt")
+  .action(async (options) => {
+    const cp = await costpoint.launch(url, username, password, system);
+    cp.display();
+
+    let shouldSign = options.yes;
+    if (!shouldSign) {
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+      });
+
+      shouldSign = await new Promise((resolve) => {
+
+        rl.question("Do you want to sign this timesheet? (y/n): ", (answer) => {
+          rl.close();
+          resolve(answer.toLowerCase() === "y" || answer.toLowerCase() === "yes");
+        });
+      });
+    }
+
+    if (shouldSign) {
+      await cp.sign();
+      console.log("The timesheet has been signed successfully.");
+    } else {
+      console.log("Timesheet signing cancelled.");
+    }
+
+    await cp.close();
+  });
+
 
 program
   .command("set <line> <day> <hours>")

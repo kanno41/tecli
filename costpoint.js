@@ -30,6 +30,26 @@ class Costpoint {
     await this._waitForResponse();
   }
 
+  async sign() {
+    // Wait for Deltek to finish any background work
+    await new Promise(r => setTimeout(r, 2000));
+
+    // When we get the "are you sure?" dialog, accept it
+    this.page.on('dialog', async dialog => {
+      await dialog.accept();
+      await new Promise(r => setTimeout(r, 1000));
+    });
+    // Click the sign button
+    const signButton = await this.page.locator("#SIGN_BUT");
+    try {
+      await signButton.setTimeout(1000).click();
+      await new Promise(r => setTimeout(r, 2000));
+    } catch (e) {
+      console.error(chalk.red("Timesheet is already signed."));
+      process.exit(1);
+    }
+  }
+
   async close() {
     await this.browser.close();
   }
