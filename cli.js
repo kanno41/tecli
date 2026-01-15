@@ -3,7 +3,7 @@
 
 const chalk = require("chalk");
 const costpoint = require("./costpoint");
-const program = require("commander");
+const { program } = require("commander");
 
 require("dotenv").config();
 

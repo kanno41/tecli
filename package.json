@@ -1,6 +1,6 @@
 {
   "name": "costpoint",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "A command line utility for Costpoint.",
   "bin": "cli.js",
   "keywords": [
@@ -13,17 +13,17 @@
     "node": ">=7.6.0"
   },
   "dependencies": {
-    "chalk": "^2.4.1",
-    "cli-table": "^0.3.1",
-    "commander": "^2.18.0",
-    "dotenv": "^6.0.0",
-    "moment": "^2.22.2",
-    "puppeteer": "^1.7.0"
+    "chalk": "^5.3.0",
+    "cli-table": "^0.3.11",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "moment": "^2.30.1",
+    "puppeteer": "^24.15.0"
   },
   "devDependencies": {
-    "babel-eslint": "^9.0.0",
-    "eslint": "^5.5.0",
-    "eslint-plugin-prettier": "^2.6.2",
-    "prettier": "^1.14.2"
+    "babel-eslint": "^10.1.0",
+    "eslint": "^9.17.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "prettier": "^3.4.2"
   }
 }

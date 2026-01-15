@@ -104,21 +104,51 @@ class Costpoint {
       defaultViewport: { width: 1920, height: 1080 },
       headless: process.env.DEBUG === undefined
     });
-    this.page = (await this.browser.pages()).pop();
+    this.page = await this.browser.newPage();
   }
 
   async _login(url, username, password, database) {
     await this.page.goto(url);
+
+    await this.page.locator("#acknowledgeBtn").click();
+    await this.page.type("input[name=\"identifier\"]", username);
+    await this.page.evaluate(() => {
+      const form = document.querySelector('form');
+      form?.requestSubmit();
+    });
+    await this.page.waitForSelector("input[name=\"credentials.passcode\"]", { visible: true });
+    await this.page.type("input[name=\"credentials.passcode\"]", password);
+
+    await this.page.evaluate(() => {
+      const form = document.querySelector('form');
+      form?.requestSubmit();
+    });
+    await this.page.waitForNavigation();
+    // Deltek does some loading and javascript work before enabling the button
+    // so we wait a bit here
+    await new Promise(r => setTimeout(r, 2000));
+    await this.page.locator("#btnPromptSSO").click();
+
     await this.page.waitForSelector("#loginBtn", { visible: true });
-    await this.page.type("#USER", username);
-    await this.page.type("#CLIENT_PASSWORD", password);
-    await this.page.type("#DATABASE", database);
+    await this.page.locator("#USER").fill(username);
+    await this.page.locator("#loginBtn").click();
+    await this.page.locator("#CLIENT_PASSWORD").fill(password);
+
+    await this.page.waitForSelector("#loginBtn", { visible: true });
     await this.page.click("#loginBtn");
     try {
+
       await this.page.waitForSelector("#loginBtn", {
         hidden: true,
         timeout: 10000
       });
+
+      await this.page.locator("#ackBtn").click();
+      // Tell it not to try to install the "app"
+      await this.page.locator("#pdlgNever").click();
+
+      //await new Promise(() => {}); // never resolves
+
     } catch (e) {
       console.error(
         chalk.red(
