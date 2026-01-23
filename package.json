@@ -3,6 +3,9 @@
   "version": "0.3.7",
   "description": "A command line utility for Costpoint.",
   "bin": "cli.js",
+  "scripts": {
+    "server": "node server.js"
+  },
   "keywords": [
     "cli",
     "costpoint"
@@ -13,6 +16,7 @@
     "node": ">=7.6.0"
   },
   "dependencies": {
+    "express": "^4.21.2",
     "chalk": "^4.1.2",
     "cli-table": "^0.3.11",
     "commander": "^12.1.0",

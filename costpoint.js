@@ -25,29 +25,85 @@ class Costpoint {
     console.log(this.table.toString());
   }
 
+  getData() {
+    return {
+      dates: this.dates.map(d => ({
+        date: d.date(),
+        fullDate: d.format('YYYY-MM-DD'),
+        dayOfWeek: d.format('ddd')
+      })),
+      projects: this.table.map((row, index) => ({
+        line: row[0],
+        description: row[1],
+        hours: Object.fromEntries(
+          this.dates.map((d, i) => [d.date(), row[i + 2] === '' ? null : row[i + 2]])
+        )
+      }))
+    };
+  }
+
   async save() {
-    await this.page.keyboard.press("F5");
+    console.log("Saving timesheet...");
+    // wait until Save & Continue is actually usable
+    await this.page.waitForFunction(() => {
+      const btn = document.querySelector('#svCntBttn');
+      if (!btn) return false;
+      const cs = getComputedStyle(btn);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.pointerEvents !== 'none';
+    });
+    await this.page.keyboard.press("F6");
+
+    // Handle revisions. Currently overboard for.
+    // // wait for the revision explanation prompt to be visible
+    // await page.waitForFunction(() => {
+    //   const el = document.querySelector('#EXPLANATION_TEXT');
+    //   if (!el) return false;
+    //   const cs = getComputedStyle(el);
+    //   const r = el.getBoundingClientRect();
+    //   return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    // });
+
+    // // fill explanation
+    // await this.page.locator("#EXPLANATION_TEXT").fill(username);
+
+    // // click Continue
+    // await this.page.waitForFunction(() => {
+    //   const btn = document.querySelector('#OK_BUT___T');
+    //   const r = btn.getBoundingClientRect();
+    //   return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    // });
+    // await this.page.click('#OK_BUT___T');
+
     await this._waitForResponse();
+    console.log("Timesheet saved.");
   }
 
   async sign() {
     // Wait for Deltek to finish any background work
-    await new Promise(r => setTimeout(r, 2000));
-
-    // When we get the "are you sure?" dialog, accept it
-    this.page.on('dialog', async dialog => {
-      await dialog.accept();
-      await new Promise(r => setTimeout(r, 1000));
-    });
-    // Click the sign button
-    const signButton = await this.page.locator("#SIGN_BUT");
     try {
-      await signButton.setTimeout(1000).click();
-      await new Promise(r => setTimeout(r, 2000));
-    } catch (e) {
+      await this.page.waitForFunction(() => {
+        const btn = document.querySelector('#SIGN_BUT');
+        if (!btn) return false;
+        const cs = getComputedStyle(btn);
+        const r = btn.getBoundingClientRect();
+
+        // visible + not dimmed
+        return cs.display !== 'none'
+          && cs.visibility !== 'hidden'
+          && r.width > 0 && r.height > 0
+          && parseFloat(cs.opacity || '1') >= 1;
+      }, { timeout: 10000 });
+    } catch (error) {
       console.error(chalk.red("Timesheet is already signed."));
       process.exit(1);
     }
+
+    // Click the sign button and wait for the confirmation dialog
+    const dialogPromise = this.page.waitForEvent('dialog');
+    await this.page.locator("#SIGN_BUT").click();
+    const dialog = await dialogPromise;
+    await dialog.accept();
+
   }
 
   async close() {
@@ -76,6 +132,13 @@ class Costpoint {
       await this.page.keyboard.press("Tab");
     }
     await this._waitForResponse();
+  }
+
+  async setm(changes) {
+    // changes is an array of { line, day, hours }
+    for (const { line, day, hours } of changes) {
+      await this.set(line, day, hours);
+    }
   }
 
   async add(code) {
@@ -122,7 +185,8 @@ class Costpoint {
   async _launch() {
     this.browser = await puppeteer.launch({
       defaultViewport: { width: 1920, height: 1080 },
-      headless: process.env.DEBUG === undefined
+      headless: process.env.DEBUG === undefined,
+      args: ['--remote-debugging-port=9222', '--remote-debugging-address=127.0.0.1', '--no-sandbox']
     });
     this.page = await this.browser.newPage();
   }
@@ -144,18 +208,34 @@ class Costpoint {
       form?.requestSubmit();
     });
     await this.page.waitForNavigation();
+
     // Deltek does some loading and javascript work before enabling the button
-    // so we wait a bit here
-    await new Promise(r => setTimeout(r, 2000));
+    await this.page.waitForFunction(() => {
+      const btn = document.querySelector('#btnPromptSSO');
+      const signIn = document.querySelector('#signInDiv');
+      if (!btn || !signIn) return false;
+      if (!signIn.hasAttribute('setupScreen')) return false;
+      if (signIn.hasAttribute('disableNoSystem')) return false;
+      if (btn.disabled || btn.hasAttribute('disabled')) return false;
+
+      // ensure nothing overlays the button
+      const r = btn.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const top = document.elementFromPoint(x, y);
+      return top === btn || btn.contains(top);
+    });
     await this.page.locator("#btnPromptSSO").click();
 
     await this.page.waitForSelector("#loginBtn", { visible: true });
+    await this.page.waitForSelector('#signInDiv:not([setupScreen]) #loginBtn:not([disabled])');
+    await this.page.waitForSelector('body:not([offline])'); // optional safety
     await this.page.locator("#USER").fill(username);
-    await this.page.locator("#loginBtn").click();
+
+    await clickLoginBtn(this.page);
     await this.page.locator("#CLIENT_PASSWORD").fill(password);
 
-    await this.page.waitForSelector("#loginBtn", { visible: true });
-    await this.page.click("#loginBtn");
+    await clickLoginBtn(this.page);
     try {
 
       await this.page.waitForSelector("#loginBtn", {
@@ -176,6 +256,28 @@ class Costpoint {
         )
       );
       process.exit(1);
+    }
+
+    async function clickLoginBtn(page) {
+      await page.waitForSelector("#loginBtn", { visible: true });
+      await page.waitForFunction(() => {
+        const btn = document.querySelector('#loginBtn');
+        if (!btn) return false;
+        if (btn.disabled || btn.hasAttribute('disabled')) return false;
+
+        const overlay = document.querySelector('#freezeLoginUI');
+        if (overlay) {
+          const cs = getComputedStyle(overlay);
+          if (cs.display !== 'none' && cs.visibility !== 'hidden') return false;
+        }
+
+        const r = btn.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const top = document.elementFromPoint(x, y);
+        return top === btn || btn.contains(top);
+      });
+      await page.click("#loginBtn");
     }
   }
 
