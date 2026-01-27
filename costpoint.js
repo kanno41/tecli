@@ -76,6 +76,7 @@ class Costpoint {
 
     await this._waitForResponse();
     console.log("Timesheet saved.");
+    //await new Promise(() => {}); // never resolves
   }
 
   async sign() {
@@ -142,27 +143,32 @@ class Costpoint {
   }
 
   async add(code) {
-    await this.page.evaluate(() => {
-      const button = Array.from(document.querySelectorAll("#newBttn")).pop();
-      button.click();
-    });
-    await this.page.waitForSelector(`input[type="text"]:focus`, {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    this.page.keyboard.press("F2");
+    //
+    // await this.page.evaluate(() => {
+    //   const button = Array.from(document.querySelectorAll("#newBttn")).pop();
+    //   button.click();
+    // });
+    //this.page.locator("#newBttn").click();
+    //await new Promise(() => {}); // never resolves
+    await this.page.waitForSelector("#UDT02_ID-_0_N", {
       visible: true
     });
-    await this.page.click(`input[type="text"]:focus`);
-    await this.page.type(`input[type="text"]:focus`, code);
+    await this.page.click("#UDT02_ID-_0_N");
+    await this.page.type("#UDT02_ID-_0_N", code);
     await this.page.waitForSelector("#fldAutoCompleteDiv", { visible: true });
-    const invalid = await this.page.evaluate(
-      () =>
-        document.querySelector("#v10.fldAutoCEItem").textContent ===
-        "no values found"
-    );
-    if (invalid) {
-      console.error(chalk.red("Project code does not exist."));
-      process.exit(1);
-    }
+    // const invalid = await this.page.evaluate(
+    //   () =>
+    //     document.querySelector("#v10.fldAutoCEItem").textContent ===
+    //     "no values found"
+    // );
+    // if (invalid) {
+    //   console.error(chalk.red("Project code does not exist."));
+    //   process.exit(1);
+    // }
     await this.page.keyboard.press("Tab");
-    await this.page.waitFor(
+    await this.page.waitForFunction(
       () => document.querySelector("#LINE_DESC-_0_N").value !== ""
     );
     const description = await this.page.evaluate(
@@ -180,6 +186,8 @@ class Costpoint {
     table.push([this.table.length - 1, description, code]);
     console.log("The following project has been successfully added:");
     console.log(table.toString());
+    //await new Promise(() => {}); // never resolves
+
   }
 
   async _launch() {
@@ -246,6 +254,7 @@ class Costpoint {
       await this.page.locator("#ackBtn").click();
       // Tell it not to try to install the "app"
       await this.page.locator("#pdlgNever").click();
+      await new Promise(resolve => setTimeout(resolve, 5000));
 
       //await new Promise(() => {}); // never resolves
 
@@ -360,6 +369,9 @@ class Costpoint {
   }
 
   async _skip() {
+    await this.page.keyboard.press("Tab");
+    await this.page.keyboard.press("Tab");
+    await this.page.keyboard.press("Tab");
     await this.page.keyboard.press("Tab");
     await this.page.keyboard.press("Tab");
   }

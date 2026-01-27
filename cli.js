@@ -100,6 +100,8 @@ program
     }
     try {
       const cp = await costpoint.launch(url, username, password, system);
+      // // Wait for 3 seconds to ensure the timesheet is fully loaded
+      // await new Promise(resolve => setTimeout(resolve, 3000));
       await cp.set(lineNum, dayNum, hrs);
       await cp.save();
       cp.display();
@@ -158,10 +160,10 @@ program
   .description("add project code to timesheet")
   .action(async (code) => {
     // Basic validation – code should be a non‑empty string (alphanumeric and optional dashes/underscores)
-    if (typeof code !== "string" || !/^[\w-]+$/.test(code)) {
-      console.error(chalk.red('Invalid project code. Must be a non‑empty alphanumeric string.'));
-      process.exit(1);
-    }
+    // if (typeof code !== "string" || !/^[\w-]+$/.test(code)) {
+    //   console.error(chalk.red('Invalid project code. Must be a non‑empty alphanumeric string.'));
+    //   process.exit(1);
+    // }
     try {
       const cp = await costpoint.launch(url, username, password, system);
       await cp.add(code);
