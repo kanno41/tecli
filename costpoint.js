@@ -44,6 +44,7 @@ class Costpoint {
 
   async save() {
     console.log("Saving timesheet...");
+    await new Promise(resolve => setTimeout(resolve, 5000));
     // wait until Save & Continue is actually usable
     await this.page.waitForFunction(() => {
       const btn = document.querySelector('#svCntBttn');
@@ -76,7 +77,8 @@ class Costpoint {
 
     await this._waitForResponse();
     console.log("Timesheet saved.");
-    //await new Promise(() => {}); // never resolves
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    await new Promise(() => {}); // never resolves
   }
 
   async sign() {
