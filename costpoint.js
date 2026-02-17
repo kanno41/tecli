@@ -44,7 +44,8 @@ class Costpoint {
 
   async save() {
     console.log("Saving timesheet...");
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait for the app to finish any background processing (please-wait overlay)
+    await this._waitForIdle();
     // wait until Save & Continue is actually usable
     await this.page.waitForFunction(() => {
       const btn = document.querySelector('#svCntBttn');
@@ -77,8 +78,7 @@ class Costpoint {
 
     await this._waitForResponse();
     console.log("Timesheet saved.");
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    await new Promise(() => {}); // never resolves
+    await this._waitForIdle();
   }
 
   async sign() {
@@ -102,11 +102,17 @@ class Costpoint {
     }
 
     // Click the sign button and wait for the confirmation dialog
-    const dialogPromise = this.page.waitForEvent('dialog');
+    const dialogPromise = new Promise((resolve) => {
+      this.page.once('dialog', async (dialog) => {
+        await dialog.accept();
+        resolve();
+      });
+    });
     await this.page.locator("#SIGN_BUT").click();
-    const dialog = await dialogPromise;
-    await dialog.accept();
+    await dialogPromise;
 
+    // Wait for the page to finish processing after accepting the dialog
+    await this.page.waitForNetworkIdle({ idleTime: 2000 });
   }
 
   async close() {
@@ -376,6 +382,14 @@ class Costpoint {
     await this.page.keyboard.press("Tab");
     await this.page.keyboard.press("Tab");
     await this.page.keyboard.press("Tab");
+  }
+
+  async _waitForIdle() {
+    // Wait for Costpoint's "please wait" overlay to clear.
+    // The app sets a 'wait' attribute on <html> while processing.
+    await this.page.waitForFunction(() => {
+      return !document.documentElement.hasAttribute('wait');
+    }, { timeout: 30000 });
   }
 
   async _waitForResponse() {
