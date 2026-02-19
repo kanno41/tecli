@@ -25,9 +25,94 @@ class Costpoint {
     console.log(this.table.toString());
   }
 
+  getData() {
+    return {
+      dates: this.dates.map(d => ({
+        date: d.date(),
+        fullDate: d.format('YYYY-MM-DD'),
+        dayOfWeek: d.format('ddd')
+      })),
+      projects: this.table.map((row, index) => ({
+        line: row[0],
+        description: row[1],
+        hours: Object.fromEntries(
+          this.dates.map((d, i) => [d.date(), row[i + 2] === '' ? null : row[i + 2]])
+        )
+      }))
+    };
+  }
+
   async save() {
-    await this.page.keyboard.press("F5");
+    console.log("Saving timesheet...");
+    // Wait for the app to finish any background processing (please-wait overlay)
+    await this._waitForIdle();
+    // wait until Save & Continue is actually usable
+    await this.page.waitForFunction(() => {
+      const btn = document.querySelector('#svCntBttn');
+      if (!btn) return false;
+      const cs = getComputedStyle(btn);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.pointerEvents !== 'none';
+    });
+    await this.page.keyboard.press("F6");
+
+    // Handle revisions. Currently overboard for.
+    // // wait for the revision explanation prompt to be visible
+    // await page.waitForFunction(() => {
+    //   const el = document.querySelector('#EXPLANATION_TEXT');
+    //   if (!el) return false;
+    //   const cs = getComputedStyle(el);
+    //   const r = el.getBoundingClientRect();
+    //   return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    // });
+
+    // // fill explanation
+    // await this.page.locator("#EXPLANATION_TEXT").fill(username);
+
+    // // click Continue
+    // await this.page.waitForFunction(() => {
+    //   const btn = document.querySelector('#OK_BUT___T');
+    //   const r = btn.getBoundingClientRect();
+    //   return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    // });
+    // await this.page.click('#OK_BUT___T');
+
     await this._waitForResponse();
+    console.log("Timesheet saved.");
+    await this._waitForIdle();
+  }
+
+  async sign() {
+    // Wait for Deltek to finish any background work
+    try {
+      await this.page.waitForFunction(() => {
+        const btn = document.querySelector('#SIGN_BUT');
+        if (!btn) return false;
+        const cs = getComputedStyle(btn);
+        const r = btn.getBoundingClientRect();
+
+        // visible + not dimmed
+        return cs.display !== 'none'
+          && cs.visibility !== 'hidden'
+          && r.width > 0 && r.height > 0
+          && parseFloat(cs.opacity || '1') >= 1;
+      }, { timeout: 10000 });
+    } catch (error) {
+      console.error(chalk.red("Timesheet is already signed."));
+      process.exit(1);
+    }
+
+    // Click the sign button and wait for the confirmation dialog
+    const dialogPromise = new Promise((resolve) => {
+      this.page.once('dialog', async (dialog) => {
+        await dialog.accept();
+        resolve();
+      });
+    });
+    await this.page.locator("#SIGN_BUT").click();
+    await dialogPromise;
+
+    // Wait for the page to finish processing after accepting the dialog
+    await this.page.waitForNetworkIdle({ idleTime: 2000 });
   }
 
   async close() {
@@ -58,28 +143,40 @@ class Costpoint {
     await this._waitForResponse();
   }
 
+  async setm(changes) {
+    // changes is an array of { line, day, hours }
+    for (const { line, day, hours } of changes) {
+      await this.set(line, day, hours);
+    }
+  }
+
   async add(code) {
-    await this.page.evaluate(() => {
-      const button = Array.from(document.querySelectorAll("#newBttn")).pop();
-      button.click();
-    });
-    await this.page.waitForSelector(`input[type="text"]:focus`, {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    this.page.keyboard.press("F2");
+    //
+    // await this.page.evaluate(() => {
+    //   const button = Array.from(document.querySelectorAll("#newBttn")).pop();
+    //   button.click();
+    // });
+    //this.page.locator("#newBttn").click();
+    //await new Promise(() => {}); // never resolves
+    await this.page.waitForSelector("#UDT02_ID-_0_N", {
       visible: true
     });
-    await this.page.click(`input[type="text"]:focus`);
-    await this.page.type(`input[type="text"]:focus`, code);
+    await this.page.click("#UDT02_ID-_0_N");
+    await this.page.type("#UDT02_ID-_0_N", code);
     await this.page.waitForSelector("#fldAutoCompleteDiv", { visible: true });
-    const invalid = await this.page.evaluate(
-      () =>
-        document.querySelector("#v10.fldAutoCEItem").textContent ===
-        "no values found"
-    );
-    if (invalid) {
-      console.error(chalk.red("Project code does not exist."));
-      process.exit(1);
-    }
+    // const invalid = await this.page.evaluate(
+    //   () =>
+    //     document.querySelector("#v10.fldAutoCEItem").textContent ===
+    //     "no values found"
+    // );
+    // if (invalid) {
+    //   console.error(chalk.red("Project code does not exist."));
+    //   process.exit(1);
+    // }
     await this.page.keyboard.press("Tab");
-    await this.page.waitFor(
+    await this.page.waitForFunction(
       () => document.querySelector("#LINE_DESC-_0_N").value !== ""
     );
     const description = await this.page.evaluate(
@@ -97,28 +194,78 @@ class Costpoint {
     table.push([this.table.length - 1, description, code]);
     console.log("The following project has been successfully added:");
     console.log(table.toString());
+    //await new Promise(() => {}); // never resolves
+
   }
 
   async _launch() {
     this.browser = await puppeteer.launch({
       defaultViewport: { width: 1920, height: 1080 },
-      headless: process.env.DEBUG === undefined
+      headless: process.env.DEBUG === undefined,
+      args: ['--remote-debugging-port=9222', '--remote-debugging-address=127.0.0.1', '--no-sandbox']
     });
-    this.page = (await this.browser.pages()).pop();
+    this.page = await this.browser.newPage();
   }
 
   async _login(url, username, password, database) {
     await this.page.goto(url);
+
+    await this.page.locator("#acknowledgeBtn").click();
+    await this.page.type("input[name=\"identifier\"]", username);
+    await this.page.evaluate(() => {
+      const form = document.querySelector('form');
+      form?.requestSubmit();
+    });
+    await this.page.waitForSelector("input[name=\"credentials.passcode\"]", { visible: true });
+    await this.page.type("input[name=\"credentials.passcode\"]", password);
+
+    await this.page.evaluate(() => {
+      const form = document.querySelector('form');
+      form?.requestSubmit();
+    });
+    await this.page.waitForNavigation();
+
+    // Deltek does some loading and javascript work before enabling the button
+    await this.page.waitForFunction(() => {
+      const btn = document.querySelector('#btnPromptSSO');
+      const signIn = document.querySelector('#signInDiv');
+      if (!btn || !signIn) return false;
+      if (!signIn.hasAttribute('setupScreen')) return false;
+      if (signIn.hasAttribute('disableNoSystem')) return false;
+      if (btn.disabled || btn.hasAttribute('disabled')) return false;
+
+      // ensure nothing overlays the button
+      const r = btn.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const top = document.elementFromPoint(x, y);
+      return top === btn || btn.contains(top);
+    });
+    await this.page.locator("#btnPromptSSO").click();
+
     await this.page.waitForSelector("#loginBtn", { visible: true });
-    await this.page.type("#USER", username);
-    await this.page.type("#CLIENT_PASSWORD", password);
-    await this.page.type("#DATABASE", database);
-    await this.page.click("#loginBtn");
+    await this.page.waitForSelector('#signInDiv:not([setupScreen]) #loginBtn:not([disabled])');
+    await this.page.waitForSelector('body:not([offline])'); // optional safety
+    await this.page.locator("#USER").fill(username);
+
+    await clickLoginBtn(this.page);
+    await this.page.locator("#CLIENT_PASSWORD").fill(password);
+
+    await clickLoginBtn(this.page);
     try {
+
       await this.page.waitForSelector("#loginBtn", {
         hidden: true,
         timeout: 10000
       });
+
+      await this.page.locator("#ackBtn").click();
+      // Tell it not to try to install the "app"
+      await this.page.locator("#pdlgNever").click();
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      //await new Promise(() => {}); // never resolves
+
     } catch (e) {
       console.error(
         chalk.red(
@@ -126,6 +273,28 @@ class Costpoint {
         )
       );
       process.exit(1);
+    }
+
+    async function clickLoginBtn(page) {
+      await page.waitForSelector("#loginBtn", { visible: true });
+      await page.waitForFunction(() => {
+        const btn = document.querySelector('#loginBtn');
+        if (!btn) return false;
+        if (btn.disabled || btn.hasAttribute('disabled')) return false;
+
+        const overlay = document.querySelector('#freezeLoginUI');
+        if (overlay) {
+          const cs = getComputedStyle(overlay);
+          if (cs.display !== 'none' && cs.visibility !== 'hidden') return false;
+        }
+
+        const r = btn.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const top = document.elementFromPoint(x, y);
+        return top === btn || btn.contains(top);
+      });
+      await page.click("#loginBtn");
     }
   }
 
@@ -210,6 +379,17 @@ class Costpoint {
   async _skip() {
     await this.page.keyboard.press("Tab");
     await this.page.keyboard.press("Tab");
+    await this.page.keyboard.press("Tab");
+    await this.page.keyboard.press("Tab");
+    await this.page.keyboard.press("Tab");
+  }
+
+  async _waitForIdle() {
+    // Wait for Costpoint's "please wait" overlay to clear.
+    // The app sets a 'wait' attribute on <html> while processing.
+    await this.page.waitForFunction(() => {
+      return !document.documentElement.hasAttribute('wait');
+    }, { timeout: 30000 });
   }
 
   async _waitForResponse() {
