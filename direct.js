@@ -76,7 +76,6 @@ class DirectClient {
   _trackCookies(hostname, setCookieHeaders, requestPath) {
     if (!setCookieHeaders) return;
     const jar = this._cookiesForHost(hostname);
-    const debug = process.env.DEBUG;
     // Default path per RFC 6265: directory of the request URL
     const defaultPath = requestPath ? requestPath.replace(/\/[^/]*$/, '') || '/' : '/';
     for (const sc of setCookieHeaders) {
@@ -91,7 +90,6 @@ class DirectClient {
           if (expiresDate.getTime() < Date.now()) {
             if (name in jar) {
               delete jar[name];
-              if (debug) console.log(`  [cookie] DELETED ${hostname}: ${name} (expired)`);
             }
             continue;
           }
@@ -99,12 +97,7 @@ class DirectClient {
         // Extract explicit Path from Set-Cookie
         const pathMatch = sc.match(/;\s*Path=([^;]*)/i);
         const cookiePath = pathMatch ? pathMatch[1] : defaultPath;
-        const isNew = !(name in jar);
         jar[name] = { value, path: cookiePath };
-        if (debug) {
-          if (isNew) console.log(`  [cookie] NEW ${hostname}: ${name}=${value.substring(0, 30)}... (path=${cookiePath})`);
-          else console.log(`  [cookie] UPD ${hostname}: ${name}=${value.substring(0, 30)}... (path=${cookiePath})`);
-        }
       }
     }
   }
@@ -220,7 +213,6 @@ class DirectClient {
     const followRedirects = !opts || opts.followRedirects !== false;
     const handleSaml = !opts || opts.handleSaml !== false;
     const extraHeaders = (opts && opts.headers) || {};
-    const debug = process.env.DEBUG;
 
     const resp = await this._httpRaw(method, urlPath, body, contentType, extraHeaders);
 
@@ -230,13 +222,11 @@ class DirectClient {
 
       // Check if this is a SAML redirect (to an external IdP like Okta)
       if (handleSaml && this._isSamlRedirect(loc, urlPath)) {
-        if (debug) console.log('SAML redirect detected for', urlPath, '→', loc.substring(0, 100));
         const chainResult = await this._completeSamlChain(loc);
 
         // If the SAML chain submitted a replay form and got a response, use it
         // (this IS the Costpoint response — no retry needed)
         if (chainResult) {
-          if (debug) console.log('Using replay form response (status:', chainResult.status + ')');
           if (chainResult.status >= 300 && chainResult.status < 400 && chainResult.headers.location) {
             if (followRedirects) {
               return this._http('GET', chainResult.headers.location, null, null, { ...opts, handleSaml: false });
@@ -246,14 +236,7 @@ class DirectClient {
         }
 
         // No replay form found — fall back to retrying the original request
-        if (debug) {
-          console.log('No replay form — retrying original request:', method, urlPath);
-          const gwHost = new URL(this.baseUrl).hostname;
-          const gwCookies = this.cookieJar[gwHost] || {};
-          console.log('  Cookies:', Object.keys(gwCookies).join(', '));
-        }
         const retryResp = await this._httpRaw(method, urlPath, body, contentType, extraHeaders);
-        if (debug) console.log('  Retry status:', retryResp.status, retryResp.headers.location ? '→ ' + retryResp.headers.location.substring(0, 80) : '');
         if (retryResp.status >= 300 && retryResp.status < 400 && retryResp.headers.location) {
           if (followRedirects) {
             return this._http('GET', retryResp.headers.location, null, null, { ...opts, handleSaml: false });
@@ -275,17 +258,11 @@ class DirectClient {
    * Just makes the request, tracks cookies, and returns the response.
    */
   async _httpRaw(method, urlPath, body, contentType, extraHeaders) {
-    const debug = process.env.DEBUG;
     const fullUrl = new URL(urlPath, this.baseUrl);
     const isHttps = fullUrl.protocol === 'https:';
     const lib = isHttps ? https : http;
     const reqPath = fullUrl.pathname;
     const cookieStr = this._cookieHeader(fullUrl.hostname, reqPath);
-
-    if (debug && reqPath.includes('MasterServlet')) {
-      const cookieNames = cookieStr.split('; ').map(c => c.split('=')[0]);
-      console.log(`  [req] ${method} ${reqPath} cookies: ${cookieNames.join(', ')}`);
-    }
 
     const options = {
       method,
@@ -303,12 +280,6 @@ class DirectClient {
 
     return new Promise((resolve, reject) => {
       const req = lib.request(options, res => {
-        // Log raw Set-Cookie headers for servlet responses to catch hidden cookies
-        if (debug && reqPath.includes('Servlet') && res.headers['set-cookie']) {
-          for (const sc of res.headers['set-cookie']) {
-            console.log(`  [raw set-cookie] ${sc.substring(0, 120)}`);
-          }
-        }
         this._trackCookies(fullUrl.hostname, res.headers['set-cookie'], reqPath);
         let data = '';
         res.setEncoding('utf8');
@@ -376,7 +347,6 @@ class DirectClient {
    * Always returns null — the caller (_http) handles the retry.
    */
   async _completeSamlChain(samlUrl) {
-    const debug = process.env.DEBUG;
 
     // GET the IdP page — if we're already authenticated with Okta,
     // this returns a SAML form immediately (no login needed)
@@ -384,7 +354,6 @@ class DirectClient {
       this._browserHeaders(null, null));
     // Follow redirects to reach the SAML form page
     while (resp.status >= 300 && resp.status < 400 && resp.headers.location) {
-      if (debug) console.log(`  chain init redirect: ${resp.status} → ${resp.headers.location.substring(0, 100)}`);
       resp = await this._httpRaw('GET', resp.headers.location, null, null,
         this._browserHeaders(null, null));
     }
@@ -395,15 +364,7 @@ class DirectClient {
     for (let hop = 0; hop < 10; hop++) {
       const form = this._parseSAMLForm(html);
       if (!form) {
-        if (debug) {
-          const hasForm = /<form[^>]+action=/i.test(html);
-          console.log(`  SAML chain done after ${hop} hops${hasForm ? ' (gateway replay form detected — skipping to preserve session)' : ''}`);
-        }
         break;
-      }
-      if (debug) {
-        console.log(`  SAML hop ${hop + 1}: POST → ${form.action}`);
-        console.log(`    form fields: ${form.body.substring(0, 200)}`);
       }
 
       const formUrl = new URL(form.action);
@@ -414,12 +375,10 @@ class DirectClient {
       // Follow redirects after SAML POST (ACS redirects)
       if (resp.status >= 300 && resp.status < 400 && resp.headers.location) {
         const redirectUrl = resp.headers.location;
-        if (debug) console.log(`    redirect: ${resp.status} → ${redirectUrl.substring(0, 100)}`);
 
         resp = await this._httpRaw('GET', redirectUrl, null, null,
           this._browserHeaders(currentUrl, null));
         while (resp.status >= 300 && resp.status < 400 && resp.headers.location) {
-          if (debug) console.log(`    redirect: ${resp.status} → ${resp.headers.location.substring(0, 100)}`);
           resp = await this._httpRaw('GET', resp.headers.location, null, null,
             this._browserHeaders(null, null));
         }
@@ -429,10 +388,6 @@ class DirectClient {
         html = resp.body;
       }
 
-      if (debug) {
-        const teCookies = this.cookieJar['te.leidos.com'] || {};
-        console.log(`    te.leidos.com cookies: ${Object.keys(teCookies).join(', ')}`);
-      }
     }
 
     return null;
@@ -503,13 +458,8 @@ class DirectClient {
   }
 
   async _postServlet(body) {
-    const debug = process.env.DEBUG;
     const resp = await this._http('POST', '/cpweb/MasterServlet.cps', body,
       'application/x-www-form-urlencoded', { headers: this._servletHeaders() });
-    if (debug) {
-      const preview = resp.body.substring(0, 200);
-      console.log('Servlet response (' + resp.body.length + ' bytes):', preview);
-    }
     return resp.body;
   }
 
@@ -518,7 +468,6 @@ class DirectClient {
   // =========================================================================
 
   async _init(url, username, password) {
-    const debug = process.env.DEBUG;
     const parsed = new URL(url);
     this.baseUrl = parsed.origin;
     this.sid = crypto.randomUUID().replace(/-/g, '');
@@ -539,16 +488,14 @@ class DirectClient {
 
       if (redirectParsed.hostname !== parsed.hostname) {
         // SSO redirect (e.g. Okta SAML) — handle the full SSO flow
-        console.log('SSO redirect detected, authenticating...');
         await this._ssoLogin(redirectUrl, username, password);
         ssoMode = true;
 
         // Navigate to cploginform.htm after SAML — this mirrors the browser
         // flow (root → /cpweb → /cpweb/ → cploginform.htm) and establishes
         // the gateway's identity injection context for /cpweb/* paths.
-        if (debug) console.log('Navigating to cploginform.htm to establish gateway context...');
-        const postSamlResp = await this._http('GET', parsed.pathname + parsed.search);
-        if (debug) console.log('Post-SAML cploginform status:', postSamlResp.status);
+        await this._http('GET', parsed.pathname + parsed.search);
+
       } else {
         // Same-host redirect — follow it
         await this._http('GET', redirectUrl);
@@ -559,9 +506,7 @@ class DirectClient {
     await this._cpLogin(username, password, ssoMode);
 
     // GET masterPage (captures ProcIdSeed cookie)
-    if (debug) console.log('GET masterPage.htm...');
-    const mpResp = await this._http('GET', '/cpweb/masterPage.htm');
-    if (debug) console.log('masterPage.htm status:', mpResp.status, '| body length:', mpResp.body.length);
+    await this._http('GET', '/cpweb/masterPage.htm');
 
     // Update sid from server's ProcIdSeed cookie (critical for real server —
     // the server generates its own ProcIdSeed during login which must be used as sid)
@@ -569,28 +514,16 @@ class DirectClient {
     const procIdEntry = (this.cookieJar[baseHost] || {}).ProcIdSeed;
     const serverProcId = procIdEntry ? (typeof procIdEntry === 'string' ? procIdEntry : procIdEntry.value) : null;
     if (serverProcId) {
-      if (debug && serverProcId !== this.sid) {
-        console.log('Updating sid from server ProcIdSeed:', this.sid, '->', serverProcId);
-      }
       this.sid = serverProcId;
-    }
-
-    if (debug) {
-      console.log('Cookies:', JSON.stringify(
-        Object.fromEntries(Object.entries(this.cookieJar).map(([d, c]) => [d, Object.keys(c)]))));
     }
 
     console.log('Logged in. Loading timesheet...');
 
     // LOGININFO
-    if (debug) console.log('Sending LOGININFO with sid:', this.sid);
     const loginInfoResp = await this._http('POST', '/cpweb/MasterServlet.cps',
       'sid=' + this.sid + '&LOGININFO=Y&PHONE=N',
       'application/x-www-form-urlencoded', { headers: this._servletHeaders() });
-    if (debug) {
-      console.log('LOGININFO response status:', loginInfoResp.status, '| body length:', loginInfoResp.body.length);
-      if (loginInfoResp.body.length > 0) console.log('LOGININFO response:', loginInfoResp.body.substring(0, 300));
-    }
+
     // Real server returns empty on success; mock returns responseCd='ok'
     // Fail only if body contains an explicit error
     if (loginInfoResp.body.includes('session not valid') ||
@@ -629,7 +562,6 @@ class DirectClient {
   // =========================================================================
 
   async _ssoLogin(samlUrl, username, password) {
-    const debug = process.env.DEBUG;
     const ssoOrigin = new URL(samlUrl).origin;
 
     // 1. GET the Okta SAML page — extract stateToken from HTML/JS
@@ -659,13 +591,6 @@ class DirectClient {
     const identifyResp = await this._httpJson(ssoOrigin, 'POST',
       ssoOrigin + '/idp/idx/identify', { identifier: username, stateHandle });
     const identifyData = JSON.parse(identifyResp.body);
-    if (debug) {
-      console.log('IDX identify status:', identifyResp.status);
-      const remediations = identifyData.remediation?.value?.map(r => r.name) || [];
-      console.log('IDX remediations:', remediations.join(', '));
-      if (identifyData.messages) console.log('IDX messages:', JSON.stringify(identifyData.messages));
-      if (identifyData.success) console.log('IDX success:', identifyData.success.href);
-    }
     const challengeForm = identifyData.remediation?.value?.find(
       r => r.name === 'challenge-authenticator');
     if (!challengeForm) {
@@ -673,21 +598,15 @@ class DirectClient {
       const selectForm = identifyData.remediation?.value?.find(
         r => r.name === 'select-authenticator-authenticate');
       if (selectForm) {
-        if (debug) console.log('IDX: need to select authenticator first');
         // Find password authenticator option
         const authenticators = identifyData.authenticators?.value || [];
         const pwdAuth = authenticators.find(a => a.type === 'password');
-        if (debug) console.log('IDX authenticators:', authenticators.map(a => `${a.type}(${a.id})`).join(', '));
         if (pwdAuth) {
           // Select password authenticator
           const selectResp = await this._httpJson(ssoOrigin, 'POST',
             selectForm.href,
             { authenticator: { id: pwdAuth.id }, stateHandle });
           const selectData = JSON.parse(selectResp.body);
-          if (debug) {
-            const selRemediations = selectData.remediation?.value?.map(r => r.name) || [];
-            console.log('IDX after select:', selRemediations.join(', '));
-          }
           const challengeAfterSelect = selectData.remediation?.value?.find(
             r => r.name === 'challenge-authenticator');
           if (challengeAfterSelect) {
@@ -696,12 +615,11 @@ class DirectClient {
               challengeAfterSelect.href,
               { credentials: { passcode: password }, stateHandle });
             const answerData2 = JSON.parse(answerResp2.body);
-            return this._completeSsoFromAnswer(answerData2, ssoOrigin, debug);
+            return this._completeSsoFromAnswer(answerData2);
           }
         }
         throw new Error('SSO: could not find password authenticator');
       }
-      if (debug) console.log('IDX identify full response:', JSON.stringify(identifyData).substring(0, 1000));
       throw new Error('SSO did not return password challenge after identify');
     }
 
@@ -710,14 +628,14 @@ class DirectClient {
       challengeForm.href,
       { credentials: { passcode: password }, stateHandle });
     const answerData = JSON.parse(answerResp.body);
-    await this._completeSsoFromAnswer(answerData, ssoOrigin, debug);
+    await this._completeSsoFromAnswer(answerData);
   }
 
   /**
    * Complete SSO flow from the IDX answer response — extract success redirect
    * and follow the SAML chain to establish gateway session.
    */
-  async _completeSsoFromAnswer(answerData, ssoOrigin, debug) {
+  async _completeSsoFromAnswer(answerData) {
     let redirectHref = null;
     if (answerData.success) {
       redirectHref = answerData.success.href;
@@ -728,21 +646,14 @@ class DirectClient {
     if (!redirectHref) {
       const errMsg = answerData.messages?.value?.[0]?.message;
       if (errMsg) throw new Error('SSO authentication failed: ' + errMsg);
-      if (debug) console.log('IDX answer response:', JSON.stringify(answerData).substring(0, 500));
       throw new Error('SSO authentication did not return success redirect');
     }
-
-    if (debug) console.log('SSO success redirect:', redirectHref);
 
     // Complete the identity SAML chain — this establishes our session with the
     // SAML proxy/gateway. After this, subsequent requests to /cpweb that trigger
     // app-specific SAML will be handled transparently by _http().
     await this._completeSamlChain(redirectHref);
 
-    if (debug) {
-      console.log('SSO cookies:', JSON.stringify(
-        Object.fromEntries(Object.entries(this.cookieJar).map(([d, c]) => [d, Object.keys(c)]))));
-    }
     console.log('SSO authentication complete.');
   }
 
@@ -827,13 +738,10 @@ class DirectClient {
   // Costpoint login (LoginServlet.cps)
   // =========================================================================
 
-  async _cpLogin(username, password, ssoMode) {
-    const debug = process.env.DEBUG;
+  async _cpLogin(username, password) {
 
     // Step 1: requestCd=000 — establish connection
-    const connResp = await this._http('POST', '/cpweb/LoginServlet.cps', 'requestCd=000');
-    if (debug) console.log('requestCd=000 status:', connResp.status);
-    if (debug) console.log('requestCd=000 response:', connResp.body.substring(0, 200));
+    await this._http('POST', '/cpweb/LoginServlet.cps', 'requestCd=000');
 
     // Step 2: requestCd=003 — auth config (match browser params exactly)
     let authConfig = {};
@@ -841,9 +749,7 @@ class DirectClient {
       const authConfigResp = await this._http('POST', '/cpweb/LoginServlet.cps',
         'requestCd=003&DATABASE=' + encodeURIComponent(this._system) +
         '&LANG=EN&FIDO_CONFIG=Y&U2F_CONDITIONAL_MEDIATION=Y');
-      if (debug) console.log('requestCd=003 response:', authConfigResp.body.substring(0, 300));
       try { authConfig = JSON.parse(authConfigResp.body); } catch (_) {}
-      if (debug) console.log('Auth config:', JSON.stringify(authConfig));
     }
 
     // Step 3: USER + PASSWORD flow (no requestCd=001 — browser skips it)
@@ -856,25 +762,21 @@ class DirectClient {
       '&U2F_ENABLED=Y&U2F_PA_PREFERRED=N&TIMEOUT=&BUILDNUMBER=8.2.0&LANG=EN' +
       '&STATUS=&settings=ON&NEW_UI_FL=Y';
     const userResp = await this._http('POST', '/cpweb/LoginServlet.cps', userParams);
-    if (debug) console.log('USER response:', userResp.body.substring(0, 300));
 
     if (userResp.body.includes('copyAuthData')) {
       const authJSON = userResp.body.substring('copyAuthData'.length);
       const authData = JSON.parse(authJSON);
-      if (debug) console.log('Auth data:', JSON.stringify(authData));
       const hashedPassword = this._encodePassword(
         authData.userId, password, authData.nonce, authData.ldapAuthFl, authData.sha2PasswordFl);
       const pwdResp = await this._http('POST', '/cpweb/LoginServlet.cps',
         'PASSWORD=' + encodeURIComponent(hashedPassword));
-      if (debug) console.log('PASSWORD response:', pwdResp.body.substring(0, 200));
       if (pwdResp.body.includes('error')) {
         throw new Error('Costpoint password login failed: ' + pwdResp.body);
       }
     } else {
       // Mock-backend or simple login — just send password directly
-      const pwdResp = await this._http('POST', '/cpweb/LoginServlet.cps',
+      await this._http('POST', '/cpweb/LoginServlet.cps',
         'PASSWORD=' + encodeURIComponent(password));
-      if (debug) console.log('PASSWORD (fallback) response:', pwdResp.body.substring(0, 200));
     }
   }
 
