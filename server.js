@@ -6,6 +6,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const Costpoint = require("./costpoint");
+const DirectClient = require("./direct");
 
 require("dotenv").config();
 
@@ -16,12 +17,27 @@ const url = process.env.COSTPOINT_URL;
 const username = process.env.COSTPOINT_USERNAME;
 const password = process.env.COSTPOINT_PASSWORD;
 const system = process.env.COSTPOINT_SYSTEM;
+const useDirect = process.env.COSTPOINT_DIRECT === 'true';
 
-if (!url || !username || !password || !system) {
+if (!url || !username || !password) {
   console.error(
-    "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD, COSTPOINT_SYSTEM are set in the environment."
+    "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD are set in the environment."
   );
   process.exit(1);
+}
+
+if (!useDirect && !system) {
+  console.error(
+    "COSTPOINT_SYSTEM is required when not using direct mode. Set COSTPOINT_DIRECT=true for direct protocol."
+  );
+  process.exit(1);
+}
+
+async function launchClient() {
+  if (useDirect) {
+    return DirectClient.launch(url, username, password);
+  }
+  return Costpoint.launch(url, username, password, system);
 }
 
 // Cache file location
@@ -70,7 +86,7 @@ async function saveAllChanges() {
   let cp = null;
 
   try {
-    cp = await Costpoint.launch(url, username, password, system);
+    cp = await launchClient();
 
     // Use setm for multiple changes, set for single change
     if (changesToSave.length === 1) {
@@ -112,7 +128,7 @@ async function addProject(code) {
 
   let cp = null;
   try {
-    cp = await Costpoint.launch(url, username, password, system);
+    cp = await launchClient();
     await cp.add(code);
     await cp.save();
 
@@ -144,7 +160,7 @@ async function signTimesheet() {
 
   let cp = null;
   try {
-    cp = await Costpoint.launch(url, username, password, system);
+    cp = await launchClient();
     await cp.sign();
 
     cachedData = cp.getData();
@@ -174,7 +190,7 @@ async function fetchFreshData() {
   syncStatus = "loading";
   let cp = null;
   try {
-    cp = await Costpoint.launch(url, username, password, system);
+    cp = await launchClient();
     cachedData = cp.getData();
     saveCache();
     lastError = null;

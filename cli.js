@@ -2,7 +2,8 @@
 "use strict";
 
 const chalk = require("chalk");
-const costpoint = require("./costpoint");
+const Costpoint = require("./costpoint");
+const DirectClient = require("./direct");
 const { program } = require("commander");
 const readline = require("readline");
 
@@ -12,19 +13,35 @@ const url = process.env.COSTPOINT_URL;
 const username = process.env.COSTPOINT_USERNAME;
 const password = process.env.COSTPOINT_PASSWORD;
 const system = process.env.COSTPOINT_SYSTEM;
+const useDirect = process.env.COSTPOINT_DIRECT === 'true';
 
 if (
   typeof url === "undefined" ||
   typeof username === "undefined" ||
-  typeof password === "undefined" ||
-  typeof system === "undefined"
+  typeof password === "undefined"
 ) {
   console.error(
     chalk.red(
-      "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD, COSTPOINT_SYSTEM are set in the environment.",
+      "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD are set in the environment.",
     ),
   );
   process.exit(1);
+}
+
+if (!useDirect && typeof system === "undefined") {
+  console.error(
+    chalk.red(
+      "COSTPOINT_SYSTEM is required when not using direct mode. Set COSTPOINT_DIRECT=true for direct protocol.",
+    ),
+  );
+  process.exit(1);
+}
+
+async function launchClient() {
+  if (useDirect) {
+    return DirectClient.launch(url, username, password);
+  }
+  return Costpoint.launch(url, username, password, system);
 }
 
 program
@@ -37,7 +54,7 @@ program
   .description("show timesheet")
   .action(async () => {
     try {
-      const cp = await costpoint.launch(url, username, password, system);
+      const cp = await launchClient();
       cp.display();
       await cp.close();
     } catch (e) {
@@ -52,7 +69,7 @@ program
   .option("-y, --yes", "skip confirmation prompt")
   .action(async (options) => {
     try {
-      const cp = await costpoint.launch(url, username, password, system);
+      const cp = await launchClient();
       cp.display();
 
       let shouldSign = options.yes;
@@ -99,9 +116,7 @@ program
       process.exit(1);
     }
     try {
-      const cp = await costpoint.launch(url, username, password, system);
-      // // Wait for 3 seconds to ensure the timesheet is fully loaded
-      // await new Promise(resolve => setTimeout(resolve, 3000));
+      const cp = await launchClient();
       await cp.set(lineNum, dayNum, hrs);
       await cp.save();
       cp.display();
@@ -137,7 +152,7 @@ program
     }
 
     try {
-      const cp = await costpoint.launch(url, username, password, system);
+      const cp = await launchClient();
       // Apply changes
       for (let i = 0; i < xs.length; i += 3) {
         const line = parseInt(xs[i], 10);
@@ -165,7 +180,7 @@ program
     //   process.exit(1);
     // }
     try {
-      const cp = await costpoint.launch(url, username, password, system);
+      const cp = await launchClient();
       await cp.add(code);
       cp.display();
       await cp.save();
