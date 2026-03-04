@@ -25,6 +25,7 @@ const PARENT_COL = {
 // Child column indices
 const CHILD_DAY_COL = { 1: 26, 2: 27, 3: 28, 4: 29, 5: 30, 6: 31, 7: 32 };
 const CHILD_LINE_DESC = 2;
+const CHILD_UDT02_ID = 6;  // UDT02_ID column index (verified: ZLEAVE.CMP pattern)
 const CHILD_TOTAL_ENTERED = 96;
 
 class DirectClient {
@@ -166,19 +167,95 @@ class DirectClient {
     }
   }
 
+  async add(code) {
+    console.log('Adding project code: ' + code);
+
+    // Create a new row locally at -59999 (standard Costpoint new-row number).
+    const numCols = this.childData.rows[0].length;
+    const newRow = new Array(numCols).fill('');
+    this.childData.rows.push(newRow);
+    this.childData.rowNums.push('-59999');
+    if (this.childData.rowFlags) this.childData.rowFlags.push('19');
+    const newRowIdx = this.childData.rows.length - 1;
+
+    // Populate required fields (CHARGE_ID, PAY_TYPE, PLC, etc.) from template row
+    this._resolveCharge(code, newRowIdx);
+
+    this._buildTableRows();
+  }
+
+  /**
+   * Populate a new row's required fields from an existing template row.
+   * Sets PROJECT and PAY_TYPE — the minimum fields that don't crash production.
+   * Prefers a template row with the same project prefix (e.g., ZLEAVE.*).
+   */
+  _resolveCharge(code, newRowIdx) {
+    // Find a template row — prefer same-prefix, fall back to any row with CHARGE_ID
+    let templateRow = null;
+    const codePrefix = code.split('.')[0]; // e.g., "ZLEAVE" from "ZLEAVE.FTB"
+    for (let i = 0; i < this.childData.rows.length; i++) {
+      if (i === newRowIdx) continue;
+      const row = this.childData.rows[i];
+      if (row[4] && row[CHILD_UDT02_ID] && row[CHILD_UDT02_ID].startsWith(codePrefix + '.')) {
+        templateRow = row;
+        break;
+      }
+    }
+    if (!templateRow) {
+      for (let i = 0; i < this.childData.rows.length; i++) {
+        if (i === newRowIdx) continue;
+        if (this.childData.rows[i][4]) {
+          templateRow = this.childData.rows[i];
+          break;
+        }
+      }
+    }
+
+    if (!templateRow) {
+      throw new Error('No existing row to derive charge fields from. Add a row via the Costpoint UI first.');
+    }
+
+    // Only set PROJECT + PAY_TYPE — the minimum that doesn't crash production.
+    // CHARGE_ID (col 4) in PUT data crashes production (onServletException bCloseApp=true).
+    // For ambiguous project codes (like ZLEAVE.FTB with REG/RHB pay types),
+    // the server returns "More than one charge found" — these require the
+    // charge lookup flow which also crashes production via CMD 300/201.
+    const newRow = this.childData.rows[newRowIdx];
+    newRow[CHILD_UDT02_ID] = code;                          // col 6: PROJECT
+    newRow[16] = templateRow[16] || 'REG';                   // col 16: PAY_TYPE (UDT10_ID)
+
+    console.log('Populated from template (project=' + templateRow[CHILD_UDT02_ID] +
+      '): PAY_TYPE=' + newRow[16]);
+  }
+
   async save() {
     console.log('Saving timesheet...');
 
     const body = this._buildSaveBatch();
     const respText = await this._postServlet(body);
-    const parsed = protocol.parseResponse(respText);
 
-    if (protocol.checkRescds(parsed)) {
-      throw new Error('Save requires explanation (not supported in direct client)');
+    // Detect server crash response before parsing
+    if (respText.includes('onServletException')) {
+      throw new Error('Server error (session may be invalid). Please try again.');
     }
 
+    const parsed = protocol.parseResponse(respText);
+
+    // Check for errors
+    const hasRescdError = protocol.checkRescds(parsed);
     const err = protocol.checkErrors(parsed);
-    if (err) throw new Error('Save error: ' + err);
+
+    if (hasRescdError || err) {
+      // Provide user-friendly message for common errors
+      if (err && err.includes('More than one charge found')) {
+        throw new Error(
+          'Multiple charges found for this project code. ' +
+          'This code requires charge selection which is only available in the Costpoint UI. ' +
+          'Try a project code with a single charge entry, or add this line via the Costpoint web interface.'
+        );
+      }
+      throw new Error('Save error: ' + (err || 'server rejected the save'));
+    }
 
     // Refresh data from response
     const k0Data = protocol.extract204(parsed, 0);
@@ -744,12 +821,10 @@ class DirectClient {
     await this._http('POST', '/cpweb/LoginServlet.cps', 'requestCd=000');
 
     // Step 2: requestCd=003 — auth config (match browser params exactly)
-    let authConfig = {};
     if (this._system) {
-      const authConfigResp = await this._http('POST', '/cpweb/LoginServlet.cps',
+      await this._http('POST', '/cpweb/LoginServlet.cps',
         'requestCd=003&DATABASE=' + encodeURIComponent(this._system) +
         '&LANG=EN&FIDO_CONFIG=Y&U2F_CONDITIONAL_MEDIATION=Y');
-      try { authConfig = JSON.parse(authConfigResp.body); } catch (_) {}
     }
 
     // Step 3: USER + PASSWORD flow (no requestCd=001 — browser skips it)
@@ -1057,7 +1132,8 @@ class DirectClient {
     let childRowNumbers = '';
     for (let i = 0; i < this.childData.rows.length; i++) {
       childDataStr += protocol.encodePutRow(this.childData.rows[i]) + protocol.DLM_ROW;
-      childEditFlags += '18,';
+      const rowNum = parseInt(this.childData.rowNums[i], 10);
+      childEditFlags += (rowNum < 0 ? '1,' : '18,');
       childRowNumbers += this.childData.rowNums[i] + ',';
     }
 

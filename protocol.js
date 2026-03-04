@@ -281,21 +281,31 @@ function parseFrames(frameArr) {
 
 /**
  * Extract 204 data from a parsed response for a given rsKey.
- * Finds the first 204 frame matching the rsKey with actual data.
+ * Merges all 204 frames for the rsKey (positive + negative ranges).
  */
 function extract204(parsed, rsKey) {
   const frames = parseFrames(parsed[0]);
   const datas = parsed[2];
 
+  let merged = null;
   for (let i = 0; i < frames.length; i++) {
     if (frames[i].cmdCd === 204 && frames[i].rsKey === rsKey) {
       const dataSlot = datas[i];
       if (Array.isArray(dataSlot)) {
-        return decode204Data(dataSlot);
+        const decoded = decode204Data(dataSlot);
+        if (decoded) {
+          if (!merged) {
+            merged = decoded;
+          } else {
+            merged.rowNums.push(...decoded.rowNums);
+            merged.rowFlags.push(...decoded.rowFlags);
+            merged.rows.push(...decoded.rows);
+          }
+        }
       }
     }
   }
-  return null;
+  return merged;
 }
 
 /**
