@@ -396,8 +396,10 @@
 
   async function handleAddProject() {
     const projectCodeInput = document.getElementById("project-code");
+    const projectPayTypeSelect = document.getElementById("project-pay-type");
     const confirmAddProject = document.getElementById("confirm-add-project");
     const code = projectCodeInput.value.trim();
+    const payType = projectPayTypeSelect ? projectPayTypeSelect.value : "REG";
     if (!code) {
       projectCodeInput.focus();
       return;
@@ -411,7 +413,7 @@
       const response = await fetch("/api/project", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code })
+        body: JSON.stringify({ code, payType })
       });
 
       if (!response.ok) {
@@ -421,6 +423,9 @@
 
       hideAllModals();
       projectCodeInput.value = "";
+      if (projectPayTypeSelect) {
+        projectPayTypeSelect.value = "REG";
+      }
 
       showSuccess("Project added successfully! Reloading...");
 
@@ -464,7 +469,10 @@
 
       hideAllModals();
       updateSyncStatus("idle");
-      showSuccess("Timesheet signed successfully!");
+      showSuccess("Timesheet signed successfully! Reloading...");
+      setTimeout(() => {
+        window.location.reload();
+      }, 1000);
 
     } catch (err) {
       console.error("Sign failed:", err);
@@ -549,6 +557,10 @@
     const projectCodeInput = document.getElementById("project-code");
     if (projectCodeInput) {
       projectCodeInput.value = "";
+    }
+    const projectPayTypeSelect = document.getElementById("project-pay-type");
+    if (projectPayTypeSelect) {
+      projectPayTypeSelect.value = "REG";
     }
   }
 

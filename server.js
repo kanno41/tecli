@@ -7,6 +7,7 @@ const fs = require("fs");
 const os = require("os");
 const Costpoint = require("./costpoint");
 const DirectClient = require("./direct");
+const { normalizeTimesheetStatus } = require("./timesheet-status");
 
 require("dotenv").config();
 
@@ -50,13 +51,26 @@ let isProcessing = false;
 let lastError = null;
 let syncStatus = "idle"; // idle, loading, syncing, error
 let isFetchingInitialData = false;
+const VALID_PAY_TYPES = new Set(["EWW", "RHB", "LWD", "REG"]);
+
+function hasCachedTimesheetStatus(data) {
+  return !!(
+    data &&
+    (typeof data.timesheetStatus === "string" || typeof data.timesheetStatusCode === "string")
+  );
+}
 
 // Load cache from disk on startup
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
       const data = fs.readFileSync(CACHE_FILE, "utf8");
-      cachedData = JSON.parse(data);
+      const parsedData = JSON.parse(data);
+      if (!hasCachedTimesheetStatus(parsedData)) {
+        console.log("Ignoring stale cache without timesheet status");
+        return false;
+      }
+      cachedData = parsedData;
       console.log("Loaded timesheet data from cache");
       return true;
     }
@@ -120,7 +134,7 @@ async function saveAllChanges() {
 }
 
 // Add a project to the timesheet
-async function addProject(code) {
+async function addProject(code, payType) {
   if (isProcessing) throw new Error("Another operation is in progress");
 
   isProcessing = true;
@@ -129,7 +143,7 @@ async function addProject(code) {
   let cp = null;
   try {
     cp = await launchClient();
-    await cp.add(code);
+    await cp.add(code, payType);
     await cp.save();
 
     cachedData = cp.getData();
@@ -238,6 +252,12 @@ function renderHTML(data, isLoading = false) {
   const periodStart = hasData ? data.dates[0] : null;
   const periodEnd = hasData ? data.dates[data.dates.length - 1] : null;
   const currentStatus = isLoading ? "loading" : syncStatus;
+  const timesheetStatusMeta = hasData
+    ? normalizeTimesheetStatus(data.timesheetStatusCode || data.timesheetStatus)
+    : null;
+  const timesheetStatusTitle = timesheetStatusMeta && timesheetStatusMeta.code
+    ? `Raw status code: ${timesheetStatusMeta.code}`
+    : "Raw status unavailable";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -252,7 +272,18 @@ function renderHTML(data, isLoading = false) {
     <header class="header">
       <img src="/deltek.png" alt="Str8 Outta Deltek" class="logo" />
       <div class="status-container">
-        <span id="sync-status" class="status-badge status-${currentStatus}">${currentStatus}</span>
+        <div class="status-badges">
+          <span id="sync-status" class="status-badge status-${currentStatus}">${currentStatus}</span>
+          ${timesheetStatusMeta ? `
+          <span
+            id="timesheet-status"
+            class="status-badge timesheet-status-badge timesheet-status-${timesheetStatusMeta.tone}"
+            title="${timesheetStatusTitle}"
+          >
+            ${timesheetStatusMeta.label}
+          </span>
+          ` : ""}
+        </div>
         <button id="refresh-btn" class="btn btn-secondary btn-icon" title="Refresh from Costpoint">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
@@ -277,7 +308,9 @@ function renderHTML(data, isLoading = false) {
         <thead>
           <tr>
             <th class="col-line">#</th>
+            <th class="col-code">Code</th>
             <th class="col-desc">Description</th>
+            <th class="col-pay">Pay</th>
             ${data.dates.map(d => `<th class="col-day"><div class="day-header"><span class="day-name">${d.dayOfWeek}</span><span class="day-num">${d.date}</span></div></th>`).join("")}
             <th class="col-total">Total</th>
           </tr>
@@ -286,7 +319,9 @@ function renderHTML(data, isLoading = false) {
           ${data.projects.map(project => `
           <tr data-line="${project.line}">
             <td class="col-line">${project.line}</td>
+            <td class="col-code" title="${project.code || ''}">${project.code || ''}</td>
             <td class="col-desc" title="${project.description}">${project.description}</td>
+            <td class="col-pay">${project.payType || ''}</td>
             ${data.dates.map(d => {
               const hours = project.hours[d.date];
               const displayValue = hours !== null && hours !== undefined ? hours : "";
@@ -299,7 +334,9 @@ function renderHTML(data, isLoading = false) {
         <tfoot>
           <tr class="totals-row">
             <td class="col-line"></td>
+            <td class="col-code"></td>
             <td class="col-desc">Daily Total</td>
+            <td class="col-pay"></td>
             ${data.dates.map(d => `<td class="col-day daily-total" data-day="${d.date}">0</td>`).join("")}
             <td class="col-total grand-total">0</td>
           </tr>
@@ -337,8 +374,19 @@ function renderHTML(data, isLoading = false) {
         <button class="modal-close">&times;</button>
       </div>
       <div class="modal-body">
-        <label for="project-code">Project Code:</label>
-        <input type="text" id="project-code" placeholder="Enter project code..." />
+        <div class="modal-field">
+          <label for="project-code">Project Code:</label>
+          <input type="text" id="project-code" placeholder="Enter project code..." />
+        </div>
+        <div class="modal-field">
+          <label for="project-pay-type">Pay Type:</label>
+          <select id="project-pay-type">
+            <option value="REG" selected>REG</option>
+            <option value="EWW">EWW</option>
+            <option value="RHB">RHB</option>
+            <option value="LWD">LWD</option>
+          </select>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary modal-cancel">Cancel</button>
@@ -436,14 +484,22 @@ app.post("/api/save", async (req, res) => {
 });
 
 app.post("/api/project", async (req, res) => {
-  const { code } = req.body;
+  const { code, payType } = req.body;
 
   if (!code) {
     return res.status(400).json({ error: "Missing required field: code" });
   }
 
+  const normalizedPayType = typeof payType === "string" && payType.trim()
+    ? payType.trim().toUpperCase()
+    : "REG";
+
+  if (!VALID_PAY_TYPES.has(normalizedPayType)) {
+    return res.status(400).json({ error: "Invalid pay type" });
+  }
+
   try {
-    await addProject(code);
+    await addProject(code, normalizedPayType);
     res.json({ success: true, data: cachedData });
   } catch (e) {
     res.status(500).json({ error: e.message });

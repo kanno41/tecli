@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const moment = require('moment');
 const Table = require('cli-table');
 const protocol = require('./protocol');
+const { normalizeTimesheetStatus } = require('./timesheet-status');
 
 const APP_ID = 'TMMTIMESHEET';
 const NUM_DAYS = 7;
@@ -38,6 +39,8 @@ class DirectClient {
     this.lastPutId = 0;
     this.dates = null;
     this.table = null;
+    this.timesheetStatus = 'Unknown';
+    this.timesheetStatusCode = '';
     // Keep-alive agents for connection reuse (like a browser)
     this._httpAgent = new http.Agent({ keepAlive: true });
     this._httpsAgent = new https.Agent({ keepAlive: true });
@@ -114,7 +117,10 @@ class DirectClient {
   }
 
   getData() {
+    const statusMeta = this._getTimesheetStatusMeta();
     return {
+      timesheetStatus: statusMeta.label,
+      timesheetStatusCode: statusMeta.code,
       dates: this.dates.map(d => ({
         date: d.date(),
         fullDate: d.format('YYYY-MM-DD'),
@@ -122,12 +128,20 @@ class DirectClient {
       })),
       projects: this.table.map(row => ({
         line: row[0],
-        description: row[1],
+        code: row[1],
+        description: row[2],
+        payType: row[3],
         hours: Object.fromEntries(
-          this.dates.map((d, i) => [d.date(), row[i + 2] === '' ? null : row[i + 2]])
+          this.dates.map((d, i) => [d.date(), row[i + 4] === '' ? null : row[i + 4]])
         ),
       })),
     };
+  }
+
+  _getTimesheetStatusMeta() {
+    const parentRow = this.parentData && this.parentData.rows && this.parentData.rows[0];
+    const rawStatus = parentRow ? parentRow[PARENT_COL.S_STATUS_CD] : '';
+    return normalizeTimesheetStatus(rawStatus);
   }
 
   async set(line, day, hours) {
@@ -167,65 +181,223 @@ class DirectClient {
     }
   }
 
-  async add(code) {
-    console.log('Adding project code: ' + code);
+  async add(code, payType) {
+    console.log('Adding project code: ' + code + (payType ? ' (payType=' + payType + ')' : ''));
 
-    // Create a new row locally at -59999 (standard Costpoint new-row number).
+    // Create a new row locally at -59999 with template fields from existing rows.
+    // The browser copies employee defaults from existing rows before TMMTS_NEW_TS_LINE.
     const numCols = this.childData.rows[0].length;
     const newRow = new Array(numCols).fill('');
+
+    // Copy uniform template fields from first existing row (employee ID, pay schedule, etc.)
+    const TEMPLATE_COLS = [0, 150, 151, 187, 193, 194, 197, 234, 235, 336, 398];
+    const templateRow = this.childData.rows[0];
+    for (const ci of TEMPLATE_COLS) {
+      if (ci < templateRow.length && templateRow[ci]) newRow[ci] = templateRow[ci];
+    }
+    // col[1] and col[198] are the sequence number (next line number)
+    const nextSeq = String(this.childData.rows.length + 1);
+    newRow[1] = nextSeq;
+    newRow[198] = nextSeq;
+    // col[196] and col[393] are "N" for new rows (empty in existing rows)
+    newRow[196] = 'N';
+    newRow[393] = 'N';
+
     this.childData.rows.push(newRow);
     this.childData.rowNums.push('-59999');
     if (this.childData.rowFlags) this.childData.rowFlags.push('19');
-    const newRowIdx = this.childData.rows.length - 1;
 
-    // Populate required fields (CHARGE_ID, PAY_TYPE, PLC, etc.) from template row
-    this._resolveCharge(code, newRowIdx);
+    // Step 1: TMMTS_NEW_TS_LINE — register the new row with the server.
+    // The server populates employee defaults and establishes server-side state.
+    await this._newTimesheetLine();
+
+    // Step 2: Set the project code and validate it.
+    // Find the new row (may have been replaced by server response).
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    this.childData.rows[newRowIdx][CHILD_UDT02_ID] = code;
+    await this._validateUdt02();
+
+    // Step 3: Resolve charge via server-side lookup.
+    await this._resolveChargeOnServer(code, payType);
+
+    // Step 4: Post-charge validate — tells the server the charge is accepted.
+    // Without this, the server's session state doesn't have the Account field
+    // committed, causing "Account required" on save.
+    await this._validateUdt02();
 
     this._buildTableRows();
   }
 
   /**
-   * Populate a new row's required fields from an existing template row.
-   * Sets PROJECT and PAY_TYPE — the minimum fields that don't crash production.
-   * Prefers a template row with the same project prefix (e.g., ZLEAVE.*).
+   * Validate the UDT02_ID field on a new row, populating server defaults.
+   * Sends 205 PUT + 208 VALIDATE for UDT02_ID and updates local data.
    */
-  _resolveCharge(code, newRowIdx) {
-    // Find a template row — prefer same-prefix, fall back to any row with CHARGE_ID
-    let templateRow = null;
-    const codePrefix = code.split('.')[0]; // e.g., "ZLEAVE" from "ZLEAVE.FTB"
-    for (let i = 0; i < this.childData.rows.length; i++) {
-      if (i === newRowIdx) continue;
-      const row = this.childData.rows[i];
-      if (row[4] && row[CHILD_UDT02_ID] && row[CHILD_UDT02_ID].startsWith(codePrefix + '.')) {
-        templateRow = row;
-        break;
-      }
-    }
-    if (!templateRow) {
-      for (let i = 0; i < this.childData.rows.length; i++) {
-        if (i === newRowIdx) continue;
-        if (this.childData.rows[i][4]) {
-          templateRow = this.childData.rows[i];
-          break;
-        }
-      }
-    }
-
-    if (!templateRow) {
-      throw new Error('No existing row to derive charge fields from. Add a row via the Costpoint UI first.');
-    }
-
-    // Only set PROJECT + PAY_TYPE — the minimum that doesn't crash production.
-    // CHARGE_ID (col 4) in PUT data crashes production (onServletException bCloseApp=true).
-    // For ambiguous project codes (like ZLEAVE.FTB with REG/RHB pay types),
-    // the server returns "More than one charge found" — these require the
-    // charge lookup flow which also crashes production via CMD 300/201.
+  async _validateUdt02() {
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
     const newRow = this.childData.rows[newRowIdx];
-    newRow[CHILD_UDT02_ID] = code;                          // col 6: PROJECT
-    newRow[16] = templateRow[16] || 'REG';                   // col 16: PAY_TYPE (UDT10_ID)
+    const rowNum = this.childData.rowNums[newRowIdx];
+    const encodedRow = protocol.encodePutRow(newRow);
 
-    console.log('Populated from template (project=' + templateRow[CHILD_UDT02_ID] +
-      '): PAY_TYPE=' + newRow[16]);
+    const cmds = [
+      // 205 PUT K1
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedRow + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: rowNum + ',',
+      }),
+      // 205 PUT K1 context
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' },
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '1' }, { code: 'C', value: rowNum },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedRow + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: rowNum + ',',
+      }),
+      // 208 VALIDATE UDT02_ID
+      this._wrap(this._cmd(208, [
+        { name: 'objectId', value: 'UDT02_ID' },
+        { code: 'K', value: '1' }, { code: 'C', value: rowNum },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+      ])),
+      // 204 K0 positive + negative
+      ...this._get204(0),
+      // 204 K1 positive + negative
+      ...this._get204(1),
+      this._keepalive(),
+    ];
+    const body = protocol.buildRequestBody(this.sid, cmds);
+    const respText = await this._postServlet(body);
+    const parsed = protocol.parseResponse(respText);
+
+    const err = protocol.checkErrors(parsed);
+    if (err) {
+      // "More than one charge found" is expected for multi-charge codes — not fatal
+      if (!err.includes('More than one charge')) {
+        throw new Error('UDT02_ID validate error: ' + err);
+      }
+    }
+
+    // Update local data with server-populated defaults
+    const k1Data = protocol.extract204(parsed, 1);
+    if (k1Data) {
+      const k1NewIdx = k1Data.rowNums.indexOf(rowNum);
+      if (k1NewIdx >= 0) {
+        this.childData.rows[newRowIdx] = k1Data.rows[k1NewIdx];
+      }
+    }
+    const k0Data = protocol.extract204(parsed, 0);
+    if (k0Data) this.parentData = k0Data;
+  }
+
+  /**
+   * Send CMD 300 TMMTS_NEW_TS_LINE to register a new row with the server.
+   * The server populates employee defaults (ID, pay schedule, etc.) and
+   * establishes session state needed for subsequent charge lookup.
+   * Mirrors: captured/add-ftb-req-233
+   */
+  async _newTimesheetLine() {
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    const newRow = this.childData.rows[newRowIdx];
+    const rowNum = this.childData.rowNums[newRowIdx];
+    const parentRow = this.parentData.rows[0];
+
+    const encodedChild = protocol.encodePutRow(newRow);
+    const encodedParent = protocol.encodePutRow(parentRow);
+
+    const cmds = [
+      // 1. PUT K0 parent (editFlag=18)
+      this._wrap(this._cmd(205, [
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedParent + protocol.DLM_ROW,
+        editFlag: '18,',
+        rowNumber: '0,',
+      }),
+      // 2. PUT K1 new child (editFlag=19)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedChild + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: rowNum + ',',
+      }),
+      // 3. PUT K0 context ($rsContextOnly$=Y)
+      this._wrap(this._cmd(205, [
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedParent + protocol.DLM_ROW,
+        editFlag: '18,',
+        rowNumber: '0,',
+      }),
+      // 4. PUT K1 child context ($rsContextOnly$=Y)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' },
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '1' }, { code: 'C', value: rowNum },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedChild + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: rowNum + ',',
+      }),
+      // 5. CMD 300 TMMTS_NEW_TS_LINE
+      this._wrap(this._cmd(300, [
+        ...this._actionBoilerplate(),
+        { name: 'actionId', value: 'TMMTS_NEW_TS_LINE' },
+        { name: 'restartFl', value: 'false' },
+        { code: 'C', value: rowNum },
+        { name: 'longRunActionFl', value: '0' },
+        { name: 'procUniqueId', value: APP_ID + ':A:' + this.sid + ':1' },
+        { name: 'psSchWorkflowNotifyFl', value: 'false' },
+        { code: 'K', value: '1' },
+        { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 6-7. 204 K0 positive + negative
+      ...this._get204(0),
+      // 8-9. 204 K1 positive + negative
+      ...this._get204(1),
+      // 10. keepalive
+      this._keepalive(),
+    ];
+
+    // reqIdx=1 sets K1 as the action context (matches browser)
+    const body = protocol.buildRequestBody(this.sid, cmds) + '&reqIdx=1';
+    const respText = await this._postServlet(body);
+
+    if (respText.includes('onServletException')) {
+      throw new Error('TMMTS_NEW_TS_LINE caused server error. Session may be invalid.');
+    }
+
+    const parsed = protocol.parseResponse(respText);
+    const err = protocol.checkErrors(parsed);
+    if (err) throw new Error('TMMTS_NEW_TS_LINE error: ' + err);
+
+    // Update local data with server-populated defaults
+    const k1Data = protocol.extract204(parsed, 1);
+    if (k1Data) {
+      this.childData = k1Data;
+    }
+    const k0Data = protocol.extract204(parsed, 0);
+    if (k0Data) this.parentData = k0Data;
   }
 
   async save() {
@@ -236,6 +408,7 @@ class DirectClient {
 
     // Detect server crash response before parsing
     if (respText.includes('onServletException')) {
+      console.error('Save response (first 500 chars):', respText.substring(0, 500));
       throw new Error('Server error (session may be invalid). Please try again.');
     }
 
@@ -246,14 +419,6 @@ class DirectClient {
     const err = protocol.checkErrors(parsed);
 
     if (hasRescdError || err) {
-      // Provide user-friendly message for common errors
-      if (err && err.includes('More than one charge found')) {
-        throw new Error(
-          'Multiple charges found for this project code. ' +
-          'This code requires charge selection which is only available in the Costpoint UI. ' +
-          'Try a project code with a single charge entry, or add this line via the Costpoint web interface.'
-        );
-      }
       throw new Error('Save error: ' + (err || 'server rejected the save'));
     }
 
@@ -265,6 +430,96 @@ class DirectClient {
 
     this._buildTableRows();
     console.log('Timesheet saved.');
+  }
+
+  /**
+   * Resolve a project code via the server's charge lookup dialog.
+   * Performs the 3-step flow: OPEN_RS K2 → HLKP query → CMD 300 TC_TS_CHARGE_LKP_OK.
+   * Updates this.parentData and this.childData with the resolved charge fields.
+   *
+   * For single-charge codes (1 result), auto-selects the only option.
+   * For multi-charge codes, selects the row matching payType.
+   */
+  async _resolveChargeOnServer(code, payType) {
+    // Step 1: PUT child row + OPEN_RS K2 for charge lookup
+    const openRsBody = this._buildOpenRsChargeLookup();
+    const openRsResp = await this._postServlet(openRsBody);
+    const openRsParsed = protocol.parseResponse(openRsResp);
+    const openRsErr = protocol.checkErrors(openRsParsed);
+    if (openRsErr) throw new Error('Charge lookup OPEN_RS error: ' + openRsErr);
+
+    // Step 2: HLKP query to fetch available charges
+    const hlkpBody = this._buildHlkpQuery(code);
+    const hlkpResp = await this._postServlet(hlkpBody);
+    const hlkpParsed = protocol.parseResponse(hlkpResp);
+    const hlkpErr = protocol.checkErrors(hlkpParsed);
+    if (hlkpErr) throw new Error('Charge lookup HLKP error: ' + hlkpErr);
+
+    // Extract K2 204 data (lookup results)
+    const k2Data = protocol.extract204(hlkpParsed, 2);
+    if (!k2Data || k2Data.rows.length === 0) {
+      throw new Error('No charges found for ' + code);
+    }
+
+    // Select the charge row
+    let selectedIdx;
+    if (k2Data.rows.length === 1) {
+      // Single-charge code — auto-select
+      selectedIdx = 0;
+    } else if (payType) {
+      // Multi-charge — find the row matching the desired pay type
+      selectedIdx = this._findChargeRow(k2Data.rows, payType);
+      if (selectedIdx < 0) {
+        throw new Error(
+          'Pay type ' + payType + ' not found for ' + code + '. ' +
+          'Lookup returned ' + k2Data.rows.length + ' options.'
+        );
+      }
+    } else {
+      throw new Error(
+        'Multiple charges found for ' + code + '. ' +
+        'Specify a pay type: costpoint add ' + code + ' REG'
+      );
+    }
+
+    const selectedRowNum = k2Data.rowNums[selectedIdx];
+    const selectedK2Row = k2Data.rows[selectedIdx];
+
+    // Copy charge fields from K2 selected row into K1 child row.
+    // The browser does this client-side before sending CMD 300.
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    const childRow = this.childData.rows[newRowIdx];
+    childRow[104] = selectedK2Row[5] || '';   // project code
+    childRow[108] = selectedK2Row[24] || '';   // combined code+payType (e.g., ZLEAVE.FTBRHB)
+    childRow[112] = selectedK2Row[26] || '';   // flag
+    childRow[376] = selectedK2Row[15] || '';   // pay type
+    childRow[400] = selectedK2Row[32] || '';   // project code
+
+    // Step 3: CMD 300 TC_TS_CHARGE_LKP_OK with selected charge
+    const lkpOkBody = this._buildChargeLkpOk(selectedK2Row, selectedRowNum);
+    const lkpOkResp = await this._postServlet(lkpOkBody);
+
+    if (lkpOkResp.includes('onServletException')) {
+      throw new Error('Charge lookup OK caused server error. Session may be invalid.');
+    }
+
+    const lkpOkParsed = protocol.parseResponse(lkpOkResp);
+    const lkpOkErr = protocol.checkErrors(lkpOkParsed);
+    if (lkpOkErr) throw new Error('Charge lookup OK error: ' + lkpOkErr);
+
+    // Refresh local data from response
+    const k0Data = protocol.extract204(lkpOkParsed, 0);
+    const k1Data = protocol.extract204(lkpOkParsed, 1);
+    if (k0Data) this.parentData = k0Data;
+    if (k1Data) this.childData = k1Data;
+
+    // Verify the charge was resolved (K1 should have the new row with charge data)
+    if (k1Data) {
+      const newIdx = k1Data.rowNums.indexOf('-59999');
+      if (newIdx < 0) {
+        console.log('WARNING: new row -59999 not found in K1 response');
+      }
+    }
   }
 
   async sign() {
@@ -922,9 +1177,9 @@ class DirectClient {
 
   _initTable() {
     this.table = new Table({
-      head: ['Line', 'Description', ...this.dates.map(d => d.format('D'))],
-      colWidths: [6, 26, ...this.dates.slice().fill(5)],
-      colAligns: ['middle', 'left', ...this.dates.slice().fill('middle')],
+      head: ['Line', 'Code', 'Description', 'Pay', ...this.dates.map(d => d.format('D'))],
+      colWidths: [6, 14, 20, 5, ...this.dates.slice().fill(5)],
+      colAligns: ['middle', 'left', 'left', 'left', ...this.dates.slice().fill('middle')],
     });
   }
 
@@ -933,13 +1188,15 @@ class DirectClient {
     this.table.length = 0;
     for (let i = 0; i < this.childData.rows.length; i++) {
       const row = this.childData.rows[i];
+      const code = row[CHILD_UDT02_ID] || '';
       const desc = row[CHILD_LINE_DESC] || '';
+      const payType = row[16] || '';
       const hours = [];
       for (let d = 1; d <= NUM_DAYS; d++) {
         const val = row[CHILD_DAY_COL[d]];
         hours.push(val ? parseFloat(val) : '');
       }
-      this.table.push([i, desc, ...hours]);
+      this.table.push([i, code, desc, payType, ...hours]);
     }
   }
 
@@ -1133,7 +1390,7 @@ class DirectClient {
     for (let i = 0; i < this.childData.rows.length; i++) {
       childDataStr += protocol.encodePutRow(this.childData.rows[i]) + protocol.DLM_ROW;
       const rowNum = parseInt(this.childData.rowNums[i], 10);
-      childEditFlags += (rowNum < 0 ? '1,' : '18,');
+      childEditFlags += (rowNum < 0 ? '19,' : '18,');
       childRowNumbers += this.childData.rowNums[i] + ',';
     }
 
@@ -1172,6 +1429,276 @@ class DirectClient {
       this._keepalive(),
     ];
     return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  // =========================================================================
+  // Command builders — charge lookup (multi-charge resolution)
+  // =========================================================================
+
+  /**
+   * Find the charge row matching the desired pay type in HLKP results.
+   * Uses K2 col[15] (PAY_TYPE) for matching — verified from captured HLKP data.
+   */
+  _findChargeRow(rows, payType) {
+    const K2_PAY_TYPE_COL = 15;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][K2_PAY_TYPE_COL] === payType) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Build CMD 201 batch to open the K2 charge lookup RS.
+   * Sends current child row state before opening.
+   */
+  _buildOpenRsChargeLookup() {
+    // Find the new row (negative rowNum)
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    if (newRowIdx < 0) throw new Error('No new row found for charge lookup');
+
+    const newRow = this.childData.rows[newRowIdx];
+    const rowNum = this.childData.rowNums[newRowIdx];
+    const encodedRow = protocol.encodePutRow(newRow);
+
+    const cmds = [
+      // PUT K1 (current child row state)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedRow + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: rowNum + ',',
+      }),
+      // 201 OPEN_RS K2 (charge lookup)
+      this._wrap(this._cmd(201, [
+        { code: 'K', value: '2' },
+        { code: 'I', value: 'TC_UDT02_CHARGE_LKP' },
+        { code: 'N', value: '0' },
+        { code: 'L', value: '16' },
+        { code: 'P', value: '1' },
+        { name: 'objectId', value: 'UDT02_ID' },
+        { name: 'checkCache', value: '0' },
+        { code: 'C', value: '-60000' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /**
+   * Build CMD 204 HLKP batch to fetch available charges for a project code.
+   */
+  _buildHlkpQuery(code) {
+    const where = '1|C^UDT02_ID^9^' + code +
+      '^0|C^$H_LKP_SEL_LVL$^1^1^0|C^$H_LKP_SEL_ROW$^1^-2^0|';
+
+    const cmds = [
+      // 204 HLKP positive range
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'L' },
+        { code: 'R', value: 'HLKP' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: '-59999' },
+        { code: 'W', value: where },
+        { name: 'objectId', value: 'UDT02_ID' },
+        { code: 'K', value: '2' }, { code: 'C', value: '-60000' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+      ])),
+      // 204 HLKP negative range
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'L' },
+        { code: 'R', value: 'HLKP' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: '-59999' },
+        { name: 'newQry', value: 'Y' },
+        { code: 'K', value: '2' }, { code: 'C', value: '-60000' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /**
+   * Standard CMD 300 action boilerplate params (report defaults).
+   * Required by the framework even for non-report actions.
+   */
+  _actionBoilerplate() {
+    return [
+      { name: 'rptPrintAllPages', value: 'Y' },
+      { name: 'rptInclCoverPage', value: 'Y' },
+      { name: 'printRpt', value: 'N' },
+      { name: 'rptScalingFactor', value: 'DFLT' },
+      { name: 'rptPrnNofC', value: '1' },
+      { name: 'downloadRpt', value: 'Y' },
+      { name: 'emailRpt', value: 'N' },
+      { name: 'printToFileRpt', value: 'N' },
+      { name: 'rptLocale', value: 'VIEW_AS_BUILT' },
+      { name: 'runAfterRptFl', value: 'Y' },
+      { name: 'archiveRpt', value: 'N' },
+      { name: 'rptArchRelativeAbsDt', value: 'Y' },
+      { name: 'rptArchNeverDelete', value: 'Y' },
+      { name: 'syncRequest', value: 'true' },
+      { name: 'rptFormat', value: 'pdf' },
+      { name: 'printLocalRpt', value: 'N' },
+      { name: 'printSendEmail1', value: 'N' },
+      { name: 'printHomePage1', value: 'N' },
+      { name: 'printPopupAlert1', value: 'N' },
+      { name: 'printSendEmail2', value: 'N' },
+      { name: 'printHomePage2', value: 'N' },
+      { name: 'printPopupAlert2', value: 'N' },
+      { name: 'printSendEmail3', value: 'N' },
+      { name: 'printHomePage3', value: 'N' },
+      { name: 'printPopupAlert3', value: 'N' },
+      { name: 'printSendEmail4', value: 'N' },
+      { name: 'printHomePage4', value: 'N' },
+      { name: 'printPopupAlert4', value: 'N' },
+      { name: 'rptEmailAttachmentCount', value: '0' },
+    ];
+  }
+
+  /**
+   * Build CMD 300 TC_TS_CHARGE_LKP_OK batch with the selected K2 lookup row.
+   * Matches the browser's 14-command batch: 6 PUTs + CMD 300 + 6 204s + 507.
+   */
+  _buildChargeLkpOk(selectedK2Row, k2RowNum) {
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    const childRow = this.childData.rows[newRowIdx];
+    const parentRow = this.parentData.rows[0];
+
+    const encodedK2 = protocol.encodePutRow(selectedK2Row);
+    const encodedChild = protocol.encodePutRow(childRow);
+    const encodedParent = protocol.encodePutRow(parentRow);
+
+    const childRowCount = this.childData.rows.length;
+    const k1PosE = Math.max(childRowCount + 5, 40);
+    const k1NegE = -59999 + k1PosE;
+
+    const cmds = [
+      // 1. PUT K2 selected ($rsRowSelectedFlOnly$=true, editFlag=64)
+      this._wrap(this._cmd(205, [
+        { name: 'rsRowSelectedFlOnly', value: 'true' },
+        { code: 'X', value: '-59999' },
+        { code: 'K', value: '2' }, { code: 'C', value: '0' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+      ]), {
+        data: encodedK2 + protocol.DLM_ROW,
+        editFlag: '64,',
+        rowNumber: k2RowNum + ',',
+      }),
+      // 2. PUT K1 child (editFlag=19)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: '-59999' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedChild + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: '-59999,',
+      }),
+      // 3. PUT K2 selected again (editFlag=64)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '-59999' },
+        { code: 'K', value: '2' }, { code: 'C', value: '0' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedK2 + protocol.DLM_ROW,
+        editFlag: '64,',
+        rowNumber: k2RowNum + ',',
+      }),
+      // 4. PUT K1 child context ($rsContextOnly$=Y)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' },
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '1' }, { code: 'C', value: '-59999' },
+        { code: 'P', value: '0' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedChild + protocol.DLM_ROW,
+        editFlag: '19,',
+        rowNumber: '-59999,',
+      }),
+      // 5. PUT K0 parent context ($rsContextOnly$=Y, editFlag=65562)
+      this._wrap(this._cmd(205, [
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '0' }, { code: 'C', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedParent + protocol.DLM_ROW,
+        editFlag: '65562,',
+        rowNumber: '0,',
+      }),
+      // 6. PUT K2 selected context ($rsContextOnly$=Y)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '-59999' },
+        { name: 'rsContextOnly', value: 'Y' },
+        { code: 'K', value: '2' }, { code: 'C', value: '0' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), {
+        data: encodedK2 + protocol.DLM_ROW,
+        editFlag: '64,',
+        rowNumber: k2RowNum + ',',
+      }),
+      // 7. CMD 300 TC_TS_CHARGE_LKP_OK
+      this._wrap(this._cmd(300, [
+        ...this._actionBoilerplate(),
+        { name: 'actionId', value: 'TC_TS_CHARGE_LKP_OK' },
+        { name: 'restartFl', value: 'false' },
+        { code: 'C', value: '0' },
+        { name: 'longRunActionFl', value: '0' },
+        { name: 'procUniqueId', value: APP_ID + ':A:' + this.sid + ':2' },
+        { name: 'psSchWorkflowNotifyFl', value: 'false' },
+        { code: 'K', value: '2' },
+        { code: 'P', value: '1' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 8-9. 204 K0 positive + negative
+      ...this._get204(0),
+      // 10-11. 204 K1 positive + negative (C=-59999 for charge lookup context)
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: String(k1PosE) },
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: '-59999' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: String(k1NegE) },
+        { code: 'X', value: '0' }, { code: 'K', value: '1' },
+        { code: 'C', value: '-59999' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 12-13. 204 K2 positive + negative (rsType=L for lookup)
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'L' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: '-59999' },
+        { name: 'objectId', value: 'UDT02_ID' },
+        { code: 'K', value: '2' }, { code: 'C', value: '0' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+      ])),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'L' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: '-59999' },
+        { code: 'K', value: '2' }, { code: 'C', value: '0' },
+        { code: 'P', value: '1' }, { code: 'V', value: 'true' },
+      ])),
+      // 14. keepalive
+      this._keepalive(),
+    ];
+    // reqIdx=2 tells the server the action context is K2 (charge lookup RS).
+    // Without this, the server ignores the K2 row selection.
+    return protocol.buildRequestBody(this.sid, cmds) + '&reqIdx=2';
   }
 }
 

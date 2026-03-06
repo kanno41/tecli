@@ -4,6 +4,7 @@ const chalk = require("chalk");
 const moment = require("moment");
 const puppeteer = require("puppeteer");
 const Table = require("cli-table");
+const { normalizeTimesheetStatus } = require("./timesheet-status");
 
 class Costpoint {
   constructor() {
@@ -11,6 +12,8 @@ class Costpoint {
     this.page = null;
     this.table = null;
     this.dates = null;
+    this.timesheetStatus = "Unknown";
+    this.timesheetStatusCode = "";
   }
 
   static async launch(url, username, password, database) {
@@ -27,6 +30,8 @@ class Costpoint {
 
   getData() {
     return {
+      timesheetStatus: this.timesheetStatus,
+      timesheetStatusCode: this.timesheetStatusCode,
       dates: this.dates.map(d => ({
         date: d.date(),
         fullDate: d.format('YYYY-MM-DD'),
@@ -79,6 +84,7 @@ class Costpoint {
     await this._waitForResponse();
     console.log("Timesheet saved.");
     await this._waitForIdle();
+    await this._refreshTimesheetStatus();
   }
 
   async sign() {
@@ -113,6 +119,8 @@ class Costpoint {
 
     // Wait for the page to finish processing after accepting the dialog
     await this.page.waitForNetworkIdle({ idleTime: 2000 });
+    await this._waitForIdle();
+    await this._refreshTimesheetStatus();
   }
 
   async close() {
@@ -324,6 +332,8 @@ class Costpoint {
         this.table[line][day + 1] = hours ? Number.parseFloat(hours) : "";
       }
     }
+
+    await this._refreshTimesheetStatus();
   }
 
   async _dates() {
@@ -398,6 +408,65 @@ class Costpoint {
         response.url().includes("MasterServlet.cps") &&
         response.request().method() === "POST"
     );
+  }
+
+  async _refreshTimesheetStatus() {
+    const rawStatus = await this.page.evaluate(() => {
+      const readValue = (el) => {
+        if (!el) return "";
+        if ("value" in el && typeof el.value === "string" && el.value.trim()) {
+          return el.value.trim();
+        }
+        if (typeof el.textContent === "string" && el.textContent.trim()) {
+          return el.textContent.trim();
+        }
+        return "";
+      };
+
+      const selectors = [
+        "#S_STATUS_CD",
+        "[name='S_STATUS_CD']",
+        "[id='S_STATUS_CD']",
+        "[id^='S_STATUS_CD-']",
+        "[id*='S_STATUS_CD']",
+        "[data-obj-id='S_STATUS_CD']",
+      ];
+
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll(selector);
+        for (const element of elements) {
+          const value = readValue(element);
+          if (value) return value;
+        }
+      }
+
+      const statusLabels = Array.from(document.querySelectorAll("label, span, div, td"))
+        .filter((element) => {
+          const text = element.textContent ? element.textContent.trim().replace(/:$/, "") : "";
+          return text === "Status";
+        });
+
+      for (const label of statusLabels) {
+        let current = label;
+        for (let depth = 0; depth < 2 && current; depth += 1) {
+          let sibling = current.nextElementSibling;
+          while (sibling) {
+            const value = readValue(sibling);
+            if (value && value.toLowerCase() !== "status") {
+              return value;
+            }
+            sibling = sibling.nextElementSibling;
+          }
+          current = current.parentElement;
+        }
+      }
+
+      return "";
+    });
+
+    const statusMeta = normalizeTimesheetStatus(rawStatus);
+    this.timesheetStatus = statusMeta.label;
+    this.timesheetStatusCode = statusMeta.code;
   }
 }
 

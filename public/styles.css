@@ -12,6 +12,7 @@
   --color-primary-hover: #e0e0e0;
   --color-primary-light: rgba(255, 255, 255, 0.1);
   --color-accent: #888888;
+  --color-info: #60a5fa;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
   --color-error: #f87171;
@@ -62,6 +63,15 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.status-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .status-badge {
@@ -73,6 +83,10 @@ body {
   border-radius: 20px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+.timesheet-status-badge {
+  text-transform: none;
 }
 
 .status-idle {
@@ -92,6 +106,38 @@ body {
   background: var(--color-error-light);
   color: var(--color-error);
   border: 1px solid var(--color-error);
+}
+
+.timesheet-status-open {
+  background: rgba(96, 165, 250, 0.2);
+  color: var(--color-info);
+  border: 1px solid var(--color-info);
+}
+
+.timesheet-status-signed,
+.timesheet-status-missing {
+  background: rgba(251, 191, 36, 0.2);
+  color: var(--color-warning);
+  border: 1px solid var(--color-warning);
+}
+
+.timesheet-status-approved {
+  background: rgba(74, 222, 128, 0.2);
+  color: var(--color-success);
+  border: 1px solid var(--color-success);
+}
+
+.timesheet-status-rejected {
+  background: var(--color-error-light);
+  color: var(--color-error);
+  border: 1px solid var(--color-error);
+}
+
+.timesheet-status-processed,
+.timesheet-status-unknown {
+  background: rgba(136, 136, 136, 0.2);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent);
 }
 
 @keyframes pulse {
@@ -537,13 +583,18 @@ body {
   padding: 20px;
 }
 
+.modal-field + .modal-field {
+  margin-top: 16px;
+}
+
 .modal-body label {
   display: block;
   font-weight: 500;
   margin-bottom: 8px;
 }
 
-.modal-body input[type="text"] {
+.modal-body input[type="text"],
+.modal-body select {
   width: 100%;
   padding: 10px 12px;
   font-size: 14px;
@@ -556,7 +607,8 @@ body {
   transition: border-color 0.15s ease;
 }
 
-.modal-body input[type="text"]:focus {
+.modal-body input[type="text"]:focus,
+.modal-body select:focus {
   border-color: var(--color-text);
   box-shadow: 0 0 0 2px var(--color-primary-light);
 }

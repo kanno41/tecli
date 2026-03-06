@@ -55,6 +55,8 @@ program
   .action(async () => {
     try {
       const cp = await launchClient();
+      const data = cp.getData();
+      console.log(`Status: ${data.timesheetStatus}`);
       cp.display();
       await cp.close();
     } catch (e) {
@@ -171,17 +173,12 @@ program
   });
 
 program
-  .command("add <code>")
-  .description("add project code to timesheet")
-  .action(async (code) => {
-    // Basic validation – code should be a non‑empty string (alphanumeric and optional dashes/underscores)
-    // if (typeof code !== "string" || !/^[\w-]+$/.test(code)) {
-    //   console.error(chalk.red('Invalid project code. Must be a non‑empty alphanumeric string.'));
-    //   process.exit(1);
-    // }
+  .command("add <code> [payType]")
+  .description("add project code to timesheet (payType: REG, RHB, etc. for multi-charge codes)")
+  .action(async (code, payType) => {
     try {
       const cp = await launchClient();
-      await cp.add(code);
+      await cp.add(code, payType);
       cp.display();
       await cp.save();
       await cp.close();
