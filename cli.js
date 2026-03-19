@@ -108,7 +108,8 @@ program
 program
   .command("set <line> <day> <hours>")
   .description("set hours for given project line and day")
-  .action(async (line, day, hours) => {
+  .option("-c, --comment <text>", "comment for the cell (direct mode only)")
+  .action(async (line, day, hours, options) => {
     // Basic validation of inputs
     const lineNum = parseInt(line, 10);
     const dayNum = parseInt(day, 10);
@@ -117,9 +118,13 @@ program
       console.error(chalk.red('Invalid arguments: line, day, and hours must be numeric.'));
       process.exit(1);
     }
+    if (options.comment && !useDirect) {
+      console.error(chalk.red('--comment is only supported in direct mode (COSTPOINT_DIRECT=true).'));
+      process.exit(1);
+    }
     try {
       const cp = await launchClient();
-      await cp.set(lineNum, dayNum, hrs);
+      await cp.set(lineNum, dayNum, hrs, options.comment);
       await cp.save();
       cp.display();
       await cp.close();

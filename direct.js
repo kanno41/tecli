@@ -25,6 +25,7 @@ const PARENT_COL = {
 
 // Child column indices
 const CHILD_DAY_COL = { 1: 26, 2: 27, 3: 28, 4: 29, 5: 30, 6: 31, 7: 32 };
+const CHILD_COMMENT_COL = { 1: 124, 2: 135, 3: 143, 4: 144, 5: 145, 6: 146, 7: 147 };
 const CHILD_LINE_DESC = 2;
 const CHILD_UDT02_ID = 6;  // UDT02_ID column index (verified: ZLEAVE.CMP pattern)
 const CHILD_TOTAL_ENTERED = 96;
@@ -144,7 +145,7 @@ class DirectClient {
     return normalizeTimesheetStatus(rawStatus);
   }
 
-  async set(line, day, hours) {
+  async set(line, day, hours, comment) {
     const start = this.dates[0].date();
     const dayOffset = day - start;
     const dayNum = dayOffset + 1;
@@ -153,6 +154,11 @@ class DirectClient {
 
     // Update local child data
     this.childData.rows[line][childCol] = String(hours);
+
+    // Set comment if provided
+    if (comment !== undefined && comment !== null) {
+      this.childData.rows[line][CHILD_COMMENT_COL[dayNum]] = comment;
+    }
 
     // Send cell edit batch (205+208+204s+507)
     const body = this._buildCellEditBatch(line, rowNum, dayNum);
@@ -1194,7 +1200,12 @@ class DirectClient {
       const hours = [];
       for (let d = 1; d <= NUM_DAYS; d++) {
         const val = row[CHILD_DAY_COL[d]];
-        hours.push(val ? parseFloat(val) : '');
+        const comment = row[CHILD_COMMENT_COL[d]] || '';
+        if (val) {
+          hours.push(parseFloat(val) + (comment ? '*' : ''));
+        } else {
+          hours.push('');
+        }
       }
       this.table.push([i, code, desc, payType, ...hours]);
     }
