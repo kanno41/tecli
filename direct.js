@@ -17,6 +17,7 @@ const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/
 const PARENT_COL = {
   EMPL_FULL_NAME: 0,
   EMPL_ID: 1,
+  SCHEDULE_DESC: 2,
   END_DT: 3,
   S_STATUS_CD: 4,
   ENABLE_SIGN_FL: 565,
@@ -30,6 +31,16 @@ const CHILD_LINE_DESC = 2;
 const CHILD_UDT02_ID = 6;  // UDT02_ID column index (verified: ZLEAVE.CMP pattern)
 const CHILD_TOTAL_ENTERED = 96;
 
+// Java String.hashCode() — used by Costpoint framework for checkCache values
+function javaHashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0; // Convert to 32-bit integer
+  }
+  return hash;
+}
+
 class DirectClient {
   constructor() {
     this.baseUrl = '';
@@ -39,6 +50,8 @@ class DirectClient {
     this.childData = null;
     this.lastPutId = 0;
     this.dates = null;
+    this._openAppResponse = '';
+    this._openRsParentResponse = '';
     this.table = null;
     this.timesheetStatus = 'Unknown';
     this.timesheetStatusCode = '';
@@ -119,9 +132,12 @@ class DirectClient {
 
   getData() {
     const statusMeta = this._getTimesheetStatusMeta();
+    const ppWeek = this.getPayPeriodWeek();
     return {
       timesheetStatus: statusMeta.label,
       timesheetStatusCode: statusMeta.code,
+      payPeriodWeek: ppWeek.week,
+      payPeriodWeekCount: ppWeek.of,
       dates: this.dates.map(d => ({
         date: d.date(),
         fullDate: d.format('YYYY-MM-DD'),
@@ -137,6 +153,33 @@ class DirectClient {
         ),
       })),
     };
+  }
+
+  /**
+   * Get the END_DT values for all parent rows (all available periods).
+   * Useful for finding the other week of a biweekly pay period.
+   */
+  getAvailablePeriods() {
+    if (!this.parentData || !this.parentData.rows) return [];
+    return this.parentData.rows.map((row, i) => ({
+      index: i,
+      endDate: row[PARENT_COL.END_DT],
+      scheduleDesc: row[PARENT_COL.SCHEDULE_DESC],
+    }));
+  }
+
+  /**
+   * Parse "Wk N of M" from the schedule description field.
+   * Returns { week: N, of: M } or { week: null, of: null } if not found.
+   */
+  getPayPeriodWeek() {
+    const parentRow = this.parentData && this.parentData.rows && this.parentData.rows[0];
+    const desc = parentRow ? parentRow[PARENT_COL.SCHEDULE_DESC] : '';
+    const match = desc && desc.match(/Wk\s+(\d+)\s+of\s+(\d+)/i);
+    if (match) {
+      return { week: parseInt(match[1], 10), of: parseInt(match[2], 10) };
+    }
+    return { week: null, of: null };
   }
 
   _getTimesheetStatusMeta() {
@@ -533,6 +576,60 @@ class DirectClient {
     await this.save();
   }
 
+  /**
+   * Navigate to the previous timesheet period.
+   *
+   * The parent RS (K0) already contains multiple rows — one per period
+   * (up to 14, newest first). Row 0 is the current, row 1 is previous, etc.
+   * To get child data for the other period, we re-run OPEN_APP + OPEN_RS +
+   * data-fetch, which advances the server's internal cursor.
+   */
+  /**
+   * Navigate to the previous timesheet period.
+   *
+   * The parent RS (K0) already has all available periods (up to 14 rows,
+   * newest first). Child data is fetched for a specific parent row via the
+   * X parameter in CMD 204. We fetch child data with X=1 (parent row 1 =
+   * the previous period) and rebuild using that parent row's END_DT.
+   */
+  async navigateToPreviousPeriod() {
+    if (!this.parentData || this.parentData.rows.length < 2) {
+      throw new Error('No previous period available in parent data');
+    }
+    const currentEnd = this.parentData.rows[0][PARENT_COL.END_DT];
+    const prevEnd = this.parentData.rows[1][PARENT_COL.END_DT];
+    console.log('Fetching previous period (current: ' + currentEnd + ', previous: ' + prevEnd + ')...');
+
+    // Use the prevChildData that was already fetched during init.
+    if (!this.prevChildData) {
+      throw new Error('No previous period child data available');
+    }
+    this.childData = this.prevChildData;
+    const row0 = this.childData.rows[0];
+    const code0 = row0 ? row0[CHILD_UDT02_ID] || '?' : '?';
+    const days0 = [];
+    if (row0) {
+      for (let d = 1; d <= NUM_DAYS; d++) days0.push(row0[CHILD_DAY_COL[d]] || '.');
+    }
+    console.log('  Using cached X=1 data: child[0] %s: days=[%s] total=%s', code0, days0.join(','), row0 ? row0[96] || '.' : '.');
+
+    // Use parent row 1's END_DT to rebuild dates
+    const endDateStr = this.parentData.rows[1][PARENT_COL.END_DT];
+    const endDate = moment(endDateStr);
+    if (!endDate.isValid()) {
+      throw new Error('Invalid END_DT for previous period: ' + endDateStr);
+    }
+    const startDate = endDate.clone().subtract(NUM_DAYS - 1, 'days');
+    this.dates = [];
+    for (let i = 0; i < NUM_DAYS; i++) {
+      this.dates.push(startDate.clone().add(i, 'days'));
+    }
+
+    this._initTable();
+    this._buildTableRows();
+    console.log('Loaded previous period: ' + this.dates[0].format('YYYY-MM-DD') + ' - ' + this.dates[6].format('YYYY-MM-DD'));
+  }
+
   async close() {
     this._httpAgent.destroy();
     this._httpsAgent.destroy();
@@ -869,11 +966,11 @@ class DirectClient {
       throw new Error('LOGININFO failed: ' + loginInfoResp.body.substring(0, 300));
     }
 
-    // OPEN_APP (507+101+507)
-    await this._postServlet(this._buildOpenApp());
+    // OPEN_APP (507+101+507) — save response for checkCache hash on re-init
+    this._openAppResponse = await this._postServlet(this._buildOpenApp());
 
     // OPEN_RS parent K0 (201+507) — must open before fetching data
-    await this._postServlet(this._buildOpenRsParent());
+    this._openRsParentResponse = await this._postServlet(this._buildOpenRsParent());
 
     // Parent data + OPEN_RS child (204+204+201+507)
     const parentResp = await this._postServlet(this._buildInitParent());
@@ -881,11 +978,111 @@ class DirectClient {
     this.parentData = protocol.extract204(parentParsed, 0);
     if (!this.parentData) throw new Error('Failed to decode parent data');
 
-    // Child data (204+204+507)
+    // Child data X=0 (204+204+507) — current period
     const childResp = await this._postServlet(this._buildInitChild());
     const childParsed = protocol.parseResponse(childResp);
     this.childData = protocol.extract204(childParsed, 1);
     if (!this.childData) throw new Error('Failed to decode child data');
+
+    // Fetch previous period child data (X=1).
+    // The browser's initial page load fetches X=1 after X=0, but the browser
+    // opens the app with a non-zero checkCache (from IndexedDB cache). Our
+    // initial open uses checkCache=0. Re-open with the correct hash to enable
+    // X=1 data, then re-fetch X=0 and X=1.
+    this.prevChildData = null;
+    if (this.parentData.rows.length > 1) {
+      try {
+        // Re-open app with correct checkCache hash (mirrors browser revisit)
+        const appHash = String(javaHashCode(this._openAppResponse));
+        const rsHash = String(javaHashCode(this._openRsParentResponse));
+        console.log('Re-opening with checkCache: app=%s rs=%s', appHash, rsHash);
+
+        await this._postServlet(protocol.buildRequestBody(this.sid, [
+          this._keepalive(),
+          this._wrap(this._cmd(101, [
+            { code: 'V', value: 'true' },
+            { name: 'mobileMode', value: 'N' },
+            { name: 'checkCache', value: appHash },
+          ])),
+          this._keepalive(),
+        ]));
+
+        // JSON: getHistoryData for TMMTS (like browser req-870)
+        await this._http('POST', '/cpweb/MasterServlet.cps',
+          JSON.stringify({ ProcIdSeed: this.sid, requests: [{ getHistoryData: { appId: 'TMMTIMESHEET', rsId: 'TMMTS', rsKeyLkpHist: -1 } }] }),
+          'application/json', { headers: this._servletHeaders() });
+
+        // Re-open parent RS with hash
+        await this._postServlet(protocol.buildRequestBody(this.sid, [
+          this._wrap(this._cmd(201, [
+            { code: 'K', value: '0' }, { code: 'I', value: 'TMMTS' },
+            { code: 'N', value: '17028' }, { code: 'T', value: 'H' },
+            { name: 'checkCache', value: rsHash },
+            { code: 'C', value: '-60000' }, { code: 'V', value: 'true' },
+          ])),
+          this._keepalive(),
+        ]));
+
+        // JSON: getHistoryData for TMMTS_TS_LINE (like browser req-873)
+        await this._http('POST', '/cpweb/MasterServlet.cps',
+          JSON.stringify({ ProcIdSeed: this.sid, requests: [{ getHistoryData: { appId: 'TMMTIMESHEET', rsId: 'TMMTS_TS_LINE', rsKeyLkpHist: -1 } }] }),
+          'application/json', { headers: this._servletHeaders() });
+
+        // Re-fetch parent data + open child RS
+        await this._postServlet(this._buildInitParent());
+
+        // Autocomplete fetch (like browser req-906)
+        await this._postServlet(
+          'sid=' + this.sid + '&cmd=204ATMMTIMESHEETC%05D%24rsType%24N%08MP%07RAUTOP%07X0P%07W%24N%24%7C1%3A20%7C0%7CP%07K0P%07C0P%07VtrueP%07C%05K%01' +
+          '&objId=K%01&editFlag=K%01&rowNumber=K%01&data=K%01&autocompletefl=Y'
+        );
+
+        // Fetch X=0 child data (re-prime)
+        await this._postServlet(this._buildInitChild());
+
+        // CMD 221 message fetch (like browser req-912)
+        await this._postServlet(protocol.buildRequestBody(this.sid, [
+          this._wrap(this._cmd(221, [
+            { name: 'metaData', value: 'TC_UNSAVED_DATA,#TM_APPROVE_TEXT,TMMTIMESHEET_CORRECT_UNDO_CONT,TM_TS_DYN_TEXT,TM_MUST_SAVE_BEFORE_APPROVE,TM_MUST_SAVE_BEFORE_SIGN' },
+            { code: 'V', value: 'true' },
+          ])),
+          this._keepalive(),
+        ]));
+
+        // NOW fetch X=1 child data
+        const prevChildBody = protocol.buildRequestBody(this.sid, [
+          this._wrap(this._cmd(204, [
+            { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+            { code: 'S', value: '0' }, { code: 'E', value: '40' },
+            { code: 'X', value: '1' }, { code: 'K', value: '1' },
+            { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+            { code: 'V', value: 'true' },
+            { name: 'nonDBSize', value: '9' }, { name: 'nonDBStart', value: '0' },
+          ])),
+          this._wrap(this._cmd(204, [
+            { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+            { code: 'S', value: '-59999' }, { code: 'E', value: '-59959' },
+            { code: 'X', value: '1' }, { code: 'K', value: '1' },
+            { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+            { code: 'V', value: 'true' },
+          ])),
+          this._keepalive(),
+        ]);
+        const prevResp = await this._postServlet(prevChildBody);
+        console.log('X=1 response after re-open: %d bytes', prevResp.length);
+        const prevParsed = protocol.parseResponse(prevResp);
+        this.prevChildData = protocol.extract204(prevParsed, 1);
+        if (this.prevChildData) {
+          const r0 = this.prevChildData.rows[0];
+          const d0 = [];
+          for (let d = 1; d <= NUM_DAYS; d++) d0.push(r0[CHILD_DAY_COL[d]] || '.');
+          console.log('Previous period: %d rows, child[0] %s: days=[%s]',
+            this.prevChildData.rows.length, r0[CHILD_UDT02_ID], d0.join(','));
+        }
+      } catch (e) {
+        console.log('Previous period child data fetch failed (non-fatal): ' + e.message);
+      }
+    }
 
     // Build dates and table
     this._buildDates();

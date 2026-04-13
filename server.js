@@ -5,6 +5,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const moment = require("moment");
 const Costpoint = require("./costpoint");
 const DirectClient = require("./direct");
 const { normalizeTimesheetStatus } = require("./timesheet-status");
@@ -41,11 +42,12 @@ async function launchClient() {
   return Costpoint.launch(url, username, password, system);
 }
 
-// Cache file location
+// Cache file location — stores per-week data keyed by week start date
 const CACHE_FILE = path.join(os.homedir(), ".costpoint-cache.json");
 
 // In-memory state
-let cachedData = null;
+let cachedWeeks = {}; // { "2026-04-06": weekData, ... }
+let activeWeekStart = null; // fullDate of the most recently fetched week
 let pendingChanges = new Map(); // key: "line-day", value: { line, day, hours }
 let isProcessing = false;
 let lastError = null;
@@ -53,26 +55,139 @@ let syncStatus = "idle"; // idle, loading, syncing, error
 let isFetchingInitialData = false;
 const VALID_PAY_TYPES = new Set(["EWW", "RHB", "LWD", "REG"]);
 
-function hasCachedTimesheetStatus(data) {
-  return !!(
-    data &&
-    (typeof data.timesheetStatus === "string" || typeof data.timesheetStatusCode === "string")
-  );
+// Get the week start date string from week data
+function weekStartKey(weekData) {
+  if (!weekData || !weekData.dates || weekData.dates.length === 0) return null;
+  return weekData.dates[0].fullDate;
+}
+
+// Store fetched week data into the cache
+function storeWeekData(weekData) {
+  const key = weekStartKey(weekData);
+  if (!key) return;
+  cachedWeeks[key] = weekData;
+  activeWeekStart = key;
+}
+
+// Build the merged 2-week view from cached data
+function getMergedData() {
+  const activeWeek = activeWeekStart ? cachedWeeks[activeWeekStart] : null;
+  if (!activeWeek) return null;
+
+  const activeStart = moment(activeWeek.dates[0].fullDate);
+
+  // Look for the adjacent week in cache (check both directions)
+  const prevStart = activeStart.clone().subtract(7, 'days');
+  const nextStart = activeStart.clone().add(7, 'days');
+  const prevWeek = cachedWeeks[prevStart.format('YYYY-MM-DD')] || null;
+  const nextWeek = cachedWeeks[nextStart.format('YYYY-MM-DD')] || null;
+
+  // Determine week1 (earlier) and week2 (later)
+  let week1Data, week2Data;
+  if (prevWeek) {
+    week1Data = prevWeek;
+    week2Data = activeWeek;
+  } else if (nextWeek) {
+    week1Data = activeWeek;
+    week2Data = nextWeek;
+  } else {
+    // No adjacent week cached — show active as week2 with empty week1
+    week1Data = null;
+    week2Data = activeWeek;
+  }
+
+  // Build 14-day date array: week1 + week2
+  const week1Start = week1Data ? moment(week1Data.dates[0].fullDate) : activeStart.clone().subtract(7, 'days');
+  const allDates = [];
+  for (let i = 0; i < 14; i++) {
+    const d = week1Start.clone().add(i, 'days');
+    allDates.push({
+      date: d.date(),
+      fullDate: d.format('YYYY-MM-DD'),
+      dayOfWeek: d.format('ddd'),
+    });
+  }
+
+  // Set of active (editable) fullDates
+  const activeDates = new Set(activeWeek.dates.map(d => d.fullDate));
+
+  // Merge projects from both weeks by code+payType
+  const projectMap = new Map();
+
+  function addProjects(weekData, weekLabel) {
+    if (!weekData) return;
+    for (const p of weekData.projects) {
+      const key = `${p.code || ''}|${p.payType || ''}`;
+      if (!projectMap.has(key)) {
+        projectMap.set(key, {
+          code: p.code,
+          description: p.description,
+          payType: p.payType,
+          hours: {},
+          lines: {},
+        });
+      }
+      const merged = projectMap.get(key);
+      // Prefer the longer description
+      if (p.description && p.description.length > (merged.description || '').length) {
+        merged.description = p.description;
+      }
+      Object.assign(merged.hours, p.hours);
+      merged.lines[weekLabel] = p.line;
+    }
+  }
+
+  addProjects(week1Data, week1Data === activeWeek ? 'active' : 'other');
+  addProjects(week2Data, week2Data === activeWeek ? 'active' : 'other');
+
+  // Assign sequential line numbers for the merged view
+  const projects = Array.from(projectMap.values()).map((p, i) => ({
+    line: i,
+    code: p.code,
+    description: p.description,
+    payType: p.payType,
+    hours: p.hours,
+    activeLine: p.lines.active,
+  }));
+
+  return {
+    dates: allDates,
+    projects,
+    activeDates: Array.from(activeDates),
+    timesheetStatus: activeWeek.timesheetStatus,
+    timesheetStatusCode: activeWeek.timesheetStatusCode,
+  };
+}
+
+// Get the active week data (raw, for API/save operations)
+function getActiveWeekData() {
+  return activeWeekStart ? cachedWeeks[activeWeekStart] : null;
 }
 
 // Load cache from disk on startup
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
-      const data = fs.readFileSync(CACHE_FILE, "utf8");
-      const parsedData = JSON.parse(data);
-      if (!hasCachedTimesheetStatus(parsedData)) {
-        console.log("Ignoring stale cache without timesheet status");
-        return false;
+      const raw = fs.readFileSync(CACHE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      // Support old single-week format: migrate to multi-week
+      if (parsed && parsed.dates && Array.isArray(parsed.dates)) {
+        const key = weekStartKey(parsed);
+        if (key) {
+          cachedWeeks = { [key]: parsed };
+          activeWeekStart = key;
+          console.log("Migrated single-week cache to multi-week format");
+          saveCache();
+          return true;
+        }
       }
-      cachedData = parsedData;
-      console.log("Loaded timesheet data from cache");
-      return true;
+      // New multi-week format
+      if (parsed && parsed.weeks) {
+        cachedWeeks = parsed.weeks;
+        activeWeekStart = parsed.activeWeekStart || null;
+        console.log("Loaded multi-week cache (" + Object.keys(cachedWeeks).length + " weeks)");
+        return true;
+      }
     }
   } catch (e) {
     console.error("Failed to load cache:", e.message);
@@ -83,7 +198,10 @@ function loadCache() {
 // Save cache to disk
 function saveCache() {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cachedData, null, 2));
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({
+      weeks: cachedWeeks,
+      activeWeekStart,
+    }, null, 2));
   } catch (e) {
     console.error("Failed to save cache:", e.message);
   }
@@ -113,7 +231,7 @@ async function saveAllChanges() {
     await cp.save();
 
     // Update cache with fresh data
-    cachedData = cp.getData();
+    storeWeekData(cp.getData());
     saveCache();
     pendingChanges.clear();
 
@@ -146,7 +264,7 @@ async function addProject(code, payType) {
     await cp.add(code, payType);
     await cp.save();
 
-    cachedData = cp.getData();
+    storeWeekData(cp.getData());
     saveCache();
 
     lastError = null;
@@ -177,7 +295,7 @@ async function signTimesheet() {
     cp = await launchClient();
     await cp.sign();
 
-    cachedData = cp.getData();
+    storeWeekData(cp.getData());
     saveCache();
 
     lastError = null;
@@ -196,7 +314,7 @@ async function signTimesheet() {
   }
 }
 
-// Fetch fresh data from Costpoint
+// Fetch fresh data from Costpoint (both current and previous week)
 async function fetchFreshData() {
   if (isProcessing) throw new Error("Another operation is in progress");
 
@@ -205,11 +323,34 @@ async function fetchFreshData() {
   let cp = null;
   try {
     cp = await launchClient();
-    cachedData = cp.getData();
+
+    // Store current week
+    const currentWeek = cp.getData();
+    storeWeekData(currentWeek);
+
+    // Navigate to the other week of the pay period.
+    // The real Costpoint "Previous" button re-inits the app, and the server
+    // moves the cursor to the previous period. For a biweekly schedule,
+    // if we're on Wk 2 this gives us Wk 1; if on Wk 1 it gives us the
+    // prior pay period's Wk 2. Either way, we cache whatever we get.
+    try {
+      await cp.navigateToPreviousPeriod();
+      const otherWeek = cp.getData();
+      const otherKey = weekStartKey(otherWeek);
+      if (otherKey) {
+        cachedWeeks[otherKey] = otherWeek;
+      }
+    } catch (navErr) {
+      console.error("Failed to fetch other period (non-fatal):", navErr.message);
+    }
+
+    // activeWeekStart stays on the current week
+    activeWeekStart = weekStartKey(currentWeek);
+
     saveCache();
     lastError = null;
     syncStatus = "idle";
-    return cachedData;
+    return getActiveWeekData();
   } catch (e) {
     console.error("Failed to fetch fresh data:", e.message);
     lastError = e.message;
@@ -252,6 +393,7 @@ function renderHTML(data, isLoading = false) {
   const periodStart = hasData ? data.dates[0] : null;
   const periodEnd = hasData ? data.dates[data.dates.length - 1] : null;
   const currentStatus = isLoading ? "loading" : syncStatus;
+  const activeDatesSet = hasData ? new Set(data.activeDates || []) : new Set();
   const timesheetStatusMeta = hasData
     ? normalizeTimesheetStatus(data.timesheetStatusCode || data.timesheetStatus)
     : null;
@@ -311,7 +453,10 @@ function renderHTML(data, isLoading = false) {
             <th class="col-code">Code</th>
             <th class="col-desc">Description</th>
             <th class="col-pay">Pay</th>
-            ${data.dates.map(d => `<th class="col-day"><div class="day-header"><span class="day-name">${d.dayOfWeek}</span><span class="day-num">${d.date}</span></div></th>`).join("")}
+            ${data.dates.map(d => {
+              const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
+              return `<th class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'}"><div class="day-header"><span class="day-name">${d.dayOfWeek}</span><span class="day-num">${d.date}</span></div></th>`;
+            }).join("")}
             <th class="col-total">Total</th>
           </tr>
         </thead>
@@ -325,7 +470,10 @@ function renderHTML(data, isLoading = false) {
             ${data.dates.map(d => {
               const hours = project.hours[d.date];
               const displayValue = hours !== null && hours !== undefined ? hours : "";
-              return `<td class="col-day"><input type="text" class="hours-input" data-line="${project.line}" data-day="${d.date}" value="${displayValue}" /></td>`;
+              const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
+              const isActive = activeDatesSet.has(d.fullDate);
+              const disabled = !isActive ? 'disabled' : '';
+              return `<td class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'} ${!isActive ? 'col-inactive' : ''}"><input type="text" class="hours-input ${!isActive ? 'inactive' : ''}" data-line="${project.line}" data-active-line="${isActive ? (project.activeLine != null ? project.activeLine : '') : ''}" data-day="${d.date}" data-fulldate="${d.fullDate}" value="${displayValue}" ${disabled} /></td>`;
             }).join("")}
             <td class="col-total row-total">0</td>
           </tr>
@@ -337,7 +485,10 @@ function renderHTML(data, isLoading = false) {
             <td class="col-code"></td>
             <td class="col-desc">Daily Total</td>
             <td class="col-pay"></td>
-            ${data.dates.map(d => `<td class="col-day daily-total" data-day="${d.date}">0</td>`).join("")}
+            ${data.dates.map(d => {
+              const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
+              return `<td class="col-day daily-total ${isWeekend ? 'col-weekend' : 'col-weekday'}" data-day="${d.date}">0</td>`;
+            }).join("")}
             <td class="col-total grand-total">0</td>
           </tr>
         </tfoot>
@@ -424,15 +575,16 @@ function renderHTML(data, isLoading = false) {
 
 // Routes
 app.get("/", (req, res) => {
+  const mergedData = getMergedData();
   // Always render immediately - show loading state if no data
-  const isLoading = !cachedData && (isFetchingInitialData || !isProcessing);
+  const isLoading = !mergedData && (isFetchingInitialData || !isProcessing);
 
   // Start background fetch if no data and not already fetching
-  if (!cachedData && !isFetchingInitialData && !isProcessing) {
+  if (!mergedData && !isFetchingInitialData && !isProcessing) {
     fetchFreshDataInBackground();
   }
 
-  res.send(renderHTML(cachedData, isLoading || isFetchingInitialData));
+  res.send(renderHTML(mergedData, isLoading || isFetchingInitialData));
 });
 
 app.get("/api/status", (req, res) => {
@@ -440,32 +592,39 @@ app.get("/api/status", (req, res) => {
     status: syncStatus,
     error: lastError,
     pendingChanges: pendingChanges.size,
-    hasData: !!cachedData
+    hasData: !!getActiveWeekData()
   });
 });
 
 app.get("/api/data", (req, res) => {
-  if (!cachedData) {
+  const data = getMergedData();
+  if (!data) {
     return res.status(404).json({ error: "No data cached" });
   }
-  res.json(cachedData);
+  res.json(data);
 });
 
 app.put("/api/hours", (req, res) => {
-  const { line, day, hours } = req.body;
+  const { line, day, hours, activeLine } = req.body;
 
-  if (line === undefined || day === undefined || hours === undefined) {
-    return res.status(400).json({ error: "Missing required fields: line, day, hours" });
+  if (activeLine === undefined || activeLine === '' || activeLine === null) {
+    return res.status(400).json({ error: "Cannot edit hours for the previous week" });
   }
 
-  // Track the change locally (will be saved when user clicks Save)
-  const key = `${line}-${day}`;
-  const hoursValue = hours === "" ? 0 : parseFloat(hours);
-  pendingChanges.set(key, { line, day, hours: hoursValue });
+  if (day === undefined || hours === undefined) {
+    return res.status(400).json({ error: "Missing required fields: day, hours" });
+  }
 
-  // Update cache optimistically (for display purposes)
-  if (cachedData) {
-    const project = cachedData.projects.find(p => p.line === line);
+  // Use the activeLine (Costpoint line number) for the save, not the merged line
+  const realLine = parseInt(activeLine, 10);
+  const key = `${realLine}-${day}`;
+  const hoursValue = hours === "" ? 0 : parseFloat(hours);
+  pendingChanges.set(key, { line: realLine, day, hours: hoursValue });
+
+  // Update active week cache optimistically
+  const activeWeek = getActiveWeekData();
+  if (activeWeek) {
+    const project = activeWeek.projects.find(p => p.line === realLine);
     if (project) {
       project.hours[day] = hours === "" ? null : parseFloat(hours);
     }
@@ -500,7 +659,7 @@ app.post("/api/project", async (req, res) => {
 
   try {
     await addProject(code, normalizedPayType);
-    res.json({ success: true, data: cachedData });
+    res.json({ success: true, data: getMergedData() });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -518,7 +677,7 @@ app.post("/api/sign", async (req, res) => {
 app.get("/api/refresh", async (req, res) => {
   try {
     await fetchFreshData();
-    res.json({ success: true, data: cachedData });
+    res.json({ success: true, data: getMergedData() });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -526,7 +685,8 @@ app.get("/api/refresh", async (req, res) => {
 
 app.delete("/api/cache", (req, res) => {
   try {
-    cachedData = null;
+    cachedWeeks = {};
+    activeWeekStart = null;
     pendingChanges.clear();
     if (fs.existsSync(CACHE_FILE)) {
       fs.unlinkSync(CACHE_FILE);
@@ -542,8 +702,9 @@ loadCache();
 
 app.listen(PORT, () => {
   console.log(`Costpoint Web UI running at http://localhost:${PORT}`);
-  if (cachedData) {
-    console.log("Using cached data - timesheet will load instantly");
+  const weekCount = Object.keys(cachedWeeks).length;
+  if (weekCount > 0) {
+    console.log(`Using cached data (${weekCount} week(s)) - timesheet will load instantly`);
   } else {
     console.log("No cache found - will fetch from Costpoint on first request");
   }

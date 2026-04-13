@@ -126,8 +126,8 @@
 
   // Attach event listeners
   function attachEventListeners() {
-    // Hours input changes
-    document.querySelectorAll(".hours-input").forEach(input => {
+    // Hours input changes (only active/enabled inputs)
+    document.querySelectorAll(".hours-input:not(:disabled)").forEach(input => {
       input.addEventListener("focus", handleInputFocus);
       input.addEventListener("blur", handleInputBlur);
       input.addEventListener("input", handleInputChange);
@@ -213,6 +213,7 @@
     const input = e.target;
     const line = parseInt(input.dataset.line);
     const day = parseInt(input.dataset.day);
+    const activeLine = input.dataset.activeLine;
     const key = `${line}-${day}`;
     const newValue = input.value.trim();
     const originalValue = originalValues.get(key);
@@ -221,7 +222,7 @@
     // Check if value differs from original
     if (newValue !== originalStr) {
       input.classList.add("modified");
-      pendingChanges.set(key, { line, day, hours: newValue });
+      pendingChanges.set(key, { line, day, hours: newValue, activeLine });
     } else {
       input.classList.remove("modified");
       pendingChanges.delete(key);
@@ -249,8 +250,8 @@
     const input = e.target;
 
     if (e.key === "Enter" || e.key === "Tab") {
-      // Move to next cell
-      const inputs = Array.from(document.querySelectorAll(".hours-input"));
+      // Move to next enabled cell
+      const inputs = Array.from(document.querySelectorAll(".hours-input:not(:disabled)"));
       const currentIndex = inputs.indexOf(input);
       const nextIndex = e.shiftKey ? currentIndex - 1 : currentIndex + 1;
 
@@ -294,12 +295,14 @@
           body: JSON.stringify({
             line: change.line,
             day: change.day,
-            hours: change.hours === "" ? "" : parseFloat(change.hours)
+            hours: change.hours === "" ? "" : parseFloat(change.hours),
+            activeLine: change.activeLine
           })
         });
 
         if (!response.ok) {
-          throw new Error(`Failed to update line ${change.line}, day ${change.day}`);
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `Failed to update line ${change.line}, day ${change.day}`);
         }
       }
 
