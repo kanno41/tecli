@@ -9,6 +9,8 @@ const Table = require('cli-table');
 const protocol = require('./protocol');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
 
+const debug = process.env.DEBUG ? (...args) => console.error(...args) : () => {};
+
 const APP_ID = 'TMMTIMESHEET';
 const NUM_DAYS = 7;
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -30,6 +32,23 @@ const CHILD_COMMENT_COL = { 1: 124, 2: 135, 3: 143, 4: 144, 5: 145, 6: 146, 7: 1
 const CHILD_LINE_DESC = 2;
 const CHILD_UDT02_ID = 6;  // UDT02_ID column index (verified: ZLEAVE.CMP pattern)
 const CHILD_TOTAL_ENTERED = 96;
+
+// Revision explanation column indices (K2 = TMMTS_TS_REVISION_EXP)
+const REV_COL = { EXPLANATION: 0, REVISION_NO: 1, CANCELLED_CD: 4, EMPL_ID: 5, PERIOD_NO_CD: 6, TS_SCHEDULE_CD: 7, YEAR: 8, TOTAL_COLS: 9 };
+// Audit column indices (K3 = TMMTS_TS_AUDIT_EXP)
+const AUDIT_COL = { REVISION_NO: 0, LINE_NO: 1, DATE: 2, PROJECT: 3, ACCOUNT: 5, CHARGE_DESC: 6, DETAIL: 7 };
+
+/**
+ * Thrown when a save attempt requires a revision explanation.
+ * The auditDetails array describes what changed.
+ */
+class RevisionRequiredError extends Error {
+  constructor(auditDetails) {
+    super('Revision explanation required');
+    this.name = 'RevisionRequiredError';
+    this.auditDetails = auditDetails || [];
+  }
+}
 
 // Java String.hashCode() — used by Costpoint framework for checkCache values
 function javaHashCode(str) {
@@ -120,9 +139,9 @@ class DirectClient {
     }
   }
 
-  static async launch(url, username, password) {
+  static async launch(url, username, password, opts) {
     const client = new DirectClient();
-    await client._init(url, username, password);
+    await client._init(url, username, password, opts);
     return client;
   }
 
@@ -188,6 +207,65 @@ class DirectClient {
     return normalizeTimesheetStatus(rawStatus);
   }
 
+  /**
+   * Get previous period data without mutating client state.
+   * Returns data in the same format as getData(), or null if unavailable.
+   */
+  getPreviousPeriodData() {
+    if (!this.prevChildData || !this.parentData || this.parentData.rows.length < 2) {
+      return null;
+    }
+
+    const endDateStr = this.parentData.rows[1][PARENT_COL.END_DT];
+    const endDate = moment(endDateStr);
+    if (!endDate.isValid()) return null;
+
+    const startDate = endDate.clone().subtract(NUM_DAYS - 1, 'days');
+    const dates = [];
+    for (let i = 0; i < NUM_DAYS; i++) {
+      dates.push(startDate.clone().add(i, 'days'));
+    }
+
+    const statusCode = this.parentData.rows[1][PARENT_COL.S_STATUS_CD] || '';
+    const statusMeta = normalizeTimesheetStatus(statusCode);
+
+    const projects = [];
+    for (let i = 0; i < this.prevChildData.rows.length; i++) {
+      const row = this.prevChildData.rows[i];
+      const code = row[CHILD_UDT02_ID] || '';
+      const desc = row[CHILD_LINE_DESC] || '';
+      const payType = row[16] || '';
+      const hours = {};
+      for (let d = 1; d <= NUM_DAYS; d++) {
+        const val = row[CHILD_DAY_COL[d]];
+        const comment = row[CHILD_COMMENT_COL[d]] || '';
+        if (val) {
+          hours[dates[d - 1].date()] = parseFloat(val) + (comment ? '*' : '');
+        } else {
+          hours[dates[d - 1].date()] = null;
+        }
+      }
+      projects.push({
+        line: i,
+        code,
+        description: desc,
+        payType,
+        hours,
+      });
+    }
+
+    return {
+      timesheetStatus: statusMeta.label,
+      timesheetStatusCode: statusMeta.code,
+      dates: dates.map(d => ({
+        date: d.date(),
+        fullDate: d.format('YYYY-MM-DD'),
+        dayOfWeek: d.format('ddd'),
+      })),
+      projects,
+    };
+  }
+
   async set(line, day, hours, comment) {
     const start = this.dates[0].date();
     const dayOffset = day - start;
@@ -231,7 +309,7 @@ class DirectClient {
   }
 
   async add(code, payType) {
-    console.log('Adding project code: ' + code + (payType ? ' (payType=' + payType + ')' : ''));
+    debug('Adding project code: ' + code + (payType ? ' (payType=' + payType + ')' : ''));
 
     // Create a new row locally at -59999 with template fields from existing rows.
     // The browser copies employee defaults from existing rows before TMMTS_NEW_TS_LINE.
@@ -450,7 +528,7 @@ class DirectClient {
   }
 
   async save() {
-    console.log('Saving timesheet...');
+    debug('Saving timesheet...');
 
     const body = this._buildSaveBatch();
     const respText = await this._postServlet(body);
@@ -467,6 +545,22 @@ class DirectClient {
     const hasRescdError = protocol.checkRescds(parsed);
     const err = protocol.checkErrors(parsed);
 
+    // Check for revision explanation required (CMD 206 returned -1).
+    // Check this BEFORE generic error handling — the -1 on CMD 206 is the definitive signal,
+    // and the server may also include an error message like "Explanation or Reject Reason is required."
+    if (hasRescdError && this._isSaveRevisionRequired(parsed)) {
+      debug('Revision explanation required — fetching audit details...');
+      // Refresh data from this response (server accepted the PUT, just blocked the save)
+      const k0Data = protocol.extract204(parsed, 0);
+      const k1Data = protocol.extract204(parsed, 1);
+      if (k0Data) this.parentData = k0Data;
+      if (k1Data) this.childData = k1Data;
+      this._buildTableRows();
+
+      const auditDetails = await this._fetchRevisionDetails();
+      throw new RevisionRequiredError(auditDetails);
+    }
+
     if (hasRescdError || err) {
       throw new Error('Save error: ' + (err || 'server rejected the save'));
     }
@@ -478,7 +572,133 @@ class DirectClient {
     if (k1Data) this.childData = k1Data;
 
     this._buildTableRows();
-    console.log('Timesheet saved.');
+    debug('Timesheet saved.');
+  }
+
+  /**
+   * Check if the save response indicates revision explanation is required.
+   * This happens when CMD 206 SAVE gets result code -1.
+   */
+  _isSaveRevisionRequired(parsed) {
+    const frames = protocol.parseFrames(parsed[0]);
+    const rescds = parsed[1];
+    let pos = 0;
+    for (let i = 0; i < frames.length; i++) {
+      if (pos >= rescds.length) break;
+      if (rescds[pos] === '-') {
+        if (frames[i].cmdCd === 206) return true;
+        pos += 2; // skip '-' and digit
+      } else {
+        pos++;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Fetch revision details by opening K2 (revision explanation) and K3 (audit) result sets.
+   * Stores revision metadata for use by saveWithExplanation().
+   * Returns audit detail rows for display.
+   */
+  async _fetchRevisionDetails() {
+    // Step 1: Open K2 (TMMTS_TS_REVISION_EXP)
+    const openK2Resp = await this._postServlet(this._buildOpenRevisionRS());
+    protocol.parseResponse(openK2Resp); // validate response
+
+    // Step 2: Query K2 + Open K3 (TMMTS_TS_AUDIT_EXP)
+    const queryK2Resp = await this._postServlet(this._buildQueryRevisionAndOpenAudit());
+    const queryK2Parsed = protocol.parseResponse(queryK2Resp);
+
+    // Extract K2 data — find the new revision row and metadata
+    const k2Data = protocol.extract204(queryK2Parsed, 2);
+    this._revisionRowNum = '-59999';
+    this._revisionNumber = 1;
+    this._revisionMeta = null;
+
+    if (k2Data && k2Data.rows.length > 0) {
+      for (let i = 0; i < k2Data.rows.length; i++) {
+        const row = k2Data.rows[i];
+        const rev = parseInt(row[REV_COL.REVISION_NO], 10);
+        if (!isNaN(rev) && rev >= this._revisionNumber) {
+          this._revisionNumber = rev;
+          // Use this row's metadata if it has EMPL_ID
+          if (row[REV_COL.EMPL_ID]) {
+            this._revisionMeta = {
+              emplId: row[REV_COL.EMPL_ID],
+              periodNoCd: row[REV_COL.PERIOD_NO_CD] || '',
+              scheduleCd: row[REV_COL.TS_SCHEDULE_CD] || '',
+              year: row[REV_COL.YEAR] || '',
+            };
+          }
+        }
+        // Track the new row (empty explanation = the one we need to fill)
+        if (!row[REV_COL.EXPLANATION] && parseInt(k2Data.rowNums[i], 10) < 0) {
+          this._revisionRowNum = k2Data.rowNums[i];
+        }
+      }
+    }
+
+    // Step 3: Query K3 (audit details)
+    const queryK3Resp = await this._postServlet(this._buildQueryAudit());
+    const queryK3Parsed = protocol.parseResponse(queryK3Resp);
+    const k3Data = protocol.extract204(queryK3Parsed, 3);
+
+    const auditDetails = [];
+    if (k3Data && k3Data.rows.length > 0) {
+      for (const row of k3Data.rows) {
+        // Only include rows from the current revision
+        if (row[AUDIT_COL.REVISION_NO] === String(this._revisionNumber)) {
+          auditDetails.push({
+            lineNo: row[AUDIT_COL.LINE_NO] || '',
+            date: row[AUDIT_COL.DATE] || '',
+            project: row[AUDIT_COL.PROJECT] || '',
+            account: row[AUDIT_COL.ACCOUNT] || '',
+            chargeDescription: row[AUDIT_COL.CHARGE_DESC] || '',
+            description: row[AUDIT_COL.DETAIL] || '',
+          });
+        }
+      }
+    }
+    return auditDetails;
+  }
+
+  /**
+   * Save with a revision explanation after save() threw RevisionRequiredError.
+   * PUTs the explanation to K2 and re-saves.
+   */
+  async saveWithExplanation(explanation) {
+    if (!this._revisionMeta) {
+      throw new Error('No revision context — call save() first.');
+    }
+    debug('Saving with revision explanation...');
+
+    const body = this._buildRevisionSaveBatch(explanation);
+    const respText = await this._postServlet(body);
+
+    if (respText.includes('onServletException')) {
+      throw new Error('Server error (session may be invalid). Please try again.');
+    }
+
+    const parsed = protocol.parseResponse(respText);
+    const hasRescdError = protocol.checkRescds(parsed);
+    const err = protocol.checkErrors(parsed);
+
+    if (hasRescdError || err) {
+      throw new Error('Save with explanation error: ' + (err || 'server rejected'));
+    }
+
+    // Refresh data
+    const k0Data = protocol.extract204(parsed, 0);
+    const k1Data = protocol.extract204(parsed, 1);
+    if (k0Data) this.parentData = k0Data;
+    if (k1Data) this.childData = k1Data;
+    this._buildTableRows();
+
+    // Clean up revision state
+    this._revisionNumber = null;
+    this._revisionMeta = null;
+    this._revisionRowNum = null;
+    debug('Timesheet saved with revision explanation.');
   }
 
   /**
@@ -566,7 +786,7 @@ class DirectClient {
     if (k1Data) {
       const newIdx = k1Data.rowNums.indexOf('-59999');
       if (newIdx < 0) {
-        console.log('WARNING: new row -59999 not found in K1 response');
+        debug('WARNING: new row -59999 not found in K1 response');
       }
     }
   }
@@ -598,7 +818,7 @@ class DirectClient {
     }
     const currentEnd = this.parentData.rows[0][PARENT_COL.END_DT];
     const prevEnd = this.parentData.rows[1][PARENT_COL.END_DT];
-    console.log('Fetching previous period (current: ' + currentEnd + ', previous: ' + prevEnd + ')...');
+    debug('Fetching previous period (current: ' + currentEnd + ', previous: ' + prevEnd + ')...');
 
     // Use the prevChildData that was already fetched during init.
     if (!this.prevChildData) {
@@ -611,7 +831,7 @@ class DirectClient {
     if (row0) {
       for (let d = 1; d <= NUM_DAYS; d++) days0.push(row0[CHILD_DAY_COL[d]] || '.');
     }
-    console.log('  Using cached X=1 data: child[0] %s: days=[%s] total=%s', code0, days0.join(','), row0 ? row0[96] || '.' : '.');
+    debug('  Using cached X=1 data: child[0] %s: days=[%s] total=%s', code0, days0.join(','), row0 ? row0[96] || '.' : '.');
 
     // Use parent row 1's END_DT to rebuild dates
     const endDateStr = this.parentData.rows[1][PARENT_COL.END_DT];
@@ -627,7 +847,60 @@ class DirectClient {
 
     this._initTable();
     this._buildTableRows();
-    console.log('Loaded previous period: ' + this.dates[0].format('YYYY-MM-DD') + ' - ' + this.dates[6].format('YYYY-MM-DD'));
+    debug('Loaded previous period: ' + this.dates[0].format('YYYY-MM-DD') + ' - ' + this.dates[6].format('YYYY-MM-DD'));
+  }
+
+  /**
+   * Fetch leave balances and details.
+   * Opens K2 (TMMTS_LVSTAT_HDR) and K3 (TMMTS_LV_STAT), queries both,
+   * and returns { balances: [...], details: [...] }.
+   */
+  async getLeaveBalances() {
+    // Step 1: Open K2 (TMMTS_LVSTAT_HDR)
+    const openK2Resp = await this._postServlet(this._buildOpenLeaveBalanceRS());
+    protocol.parseResponse(openK2Resp);
+
+    // Step 2: Query K2 (leave balances) + Open K3 (TMMTS_LV_STAT)
+    const queryK2Resp = await this._postServlet(this._buildQueryLeaveBalancesAndOpenDetail());
+    const queryK2Parsed = protocol.parseResponse(queryK2Resp);
+
+    const k2Data = protocol.extract204(queryK2Parsed, 2);
+    const balances = [];
+    if (k2Data && k2Data.rows.length > 0) {
+      for (const row of k2Data.rows) {
+        const desc = row[0] || '';
+        const balance = parseFloat(row[1]) || 0;
+        const code = row[2] || '';
+        balances.push({ description: desc, balance, code });
+      }
+    }
+
+    // Step 3: Query K3 (leave details) — default to PTO row, fallback to first non-zero balance
+    let detailRowIdx = 0;
+    for (let i = 0; i < balances.length; i++) {
+      if (balances[i].code === 'COMP') { detailRowIdx = i; break; }
+      if (detailRowIdx === 0 && balances[i].balance !== 0) detailRowIdx = i;
+    }
+
+    const queryK3Resp = await this._postServlet(this._buildQueryLeaveDetails(detailRowIdx));
+    const queryK3Parsed = protocol.parseResponse(queryK3Resp);
+
+    const k3Data = protocol.extract204(queryK3Parsed, 3);
+    const details = [];
+    if (k3Data && k3Data.rows.length > 0) {
+      for (const row of k3Data.rows) {
+        details.push({
+          date: row[0] || '',
+          type: row[1] || '',
+          hours: parseFloat(row[2]) || 0,
+          reason: row[3] || '',
+          leaveTypeCode: row[4] || '',
+          leaveTypeDesc: row[5] || '',
+        });
+      }
+    }
+
+    return { balances, details };
   }
 
   async close() {
@@ -902,13 +1175,14 @@ class DirectClient {
   // Init flow
   // =========================================================================
 
-  async _init(url, username, password) {
+  async _init(url, username, password, opts) {
+    opts = opts || {};
     const parsed = new URL(url);
     this.baseUrl = parsed.origin;
     this.sid = crypto.randomUUID().replace(/-/g, '');
     this._system = parsed.searchParams.get('system') || '';
 
-    console.log('Connecting to Costpoint...');
+    debug('Connecting to Costpoint...');
 
     // Step 1: GET login form — don't auto-follow redirects so we can detect SSO
     // Also disable SAML handling — we need to detect the SSO redirect ourselves
@@ -952,7 +1226,7 @@ class DirectClient {
       this.sid = serverProcId;
     }
 
-    console.log('Logged in. Loading timesheet...');
+    debug('Logged in. Loading timesheet...');
 
     // LOGININFO
     const loginInfoResp = await this._http('POST', '/cpweb/MasterServlet.cps',
@@ -984,18 +1258,17 @@ class DirectClient {
     this.childData = protocol.extract204(childParsed, 1);
     if (!this.childData) throw new Error('Failed to decode child data');
 
-    // Fetch previous period child data (X=1).
-    // The browser's initial page load fetches X=1 after X=0, but the browser
-    // opens the app with a non-zero checkCache (from IndexedDB cache). Our
-    // initial open uses checkCache=0. Re-open with the correct hash to enable
-    // X=1 data, then re-fetch X=0 and X=1.
+    // Fetch previous period child data (X=1) — only when requested (web UI)
+    // and the active week is week 2 of the pay period (week 1 data is the
+    // previous period). Skipped for CLI and week-1 sessions.
     this.prevChildData = null;
-    if (this.parentData.rows.length > 1) {
+    const ppWeek = this.getPayPeriodWeek();
+    if (opts.loadPreviousPeriod && ppWeek.week === 2 && this.parentData.rows.length > 1) {
       try {
         // Re-open app with correct checkCache hash (mirrors browser revisit)
         const appHash = String(javaHashCode(this._openAppResponse));
         const rsHash = String(javaHashCode(this._openRsParentResponse));
-        console.log('Re-opening with checkCache: app=%s rs=%s', appHash, rsHash);
+        debug('Re-opening with checkCache: app=%s rs=%s', appHash, rsHash);
 
         await this._postServlet(protocol.buildRequestBody(this.sid, [
           this._keepalive(),
@@ -1069,18 +1342,18 @@ class DirectClient {
           this._keepalive(),
         ]);
         const prevResp = await this._postServlet(prevChildBody);
-        console.log('X=1 response after re-open: %d bytes', prevResp.length);
+        debug('X=1 response after re-open: %d bytes', prevResp.length);
         const prevParsed = protocol.parseResponse(prevResp);
         this.prevChildData = protocol.extract204(prevParsed, 1);
         if (this.prevChildData) {
           const r0 = this.prevChildData.rows[0];
           const d0 = [];
           for (let d = 1; d <= NUM_DAYS; d++) d0.push(r0[CHILD_DAY_COL[d]] || '.');
-          console.log('Previous period: %d rows, child[0] %s: days=[%s]',
+          debug('Previous period: %d rows, child[0] %s: days=[%s]',
             this.prevChildData.rows.length, r0[CHILD_UDT02_ID], d0.join(','));
         }
       } catch (e) {
-        console.log('Previous period child data fetch failed (non-fatal): ' + e.message);
+        debug('Previous period child data fetch failed (non-fatal): ' + e.message);
       }
     }
 
@@ -1089,7 +1362,7 @@ class DirectClient {
     this._initTable();
     this._buildTableRows();
 
-    console.log('Timesheet loaded.');
+    debug('Timesheet loaded.');
   }
 
   // =========================================================================
@@ -1189,7 +1462,7 @@ class DirectClient {
     // app-specific SAML will be handled transparently by _http().
     await this._completeSamlChain(redirectHref);
 
-    console.log('SSO authentication complete.');
+    debug('SSO authentication complete.');
   }
 
   /**
@@ -1379,9 +1652,16 @@ class DirectClient {
   }
 
   _initTable() {
+    // Compute Code column width from actual data
+    let codeW = 4; // minimum ("Code".length)
+    for (const row of this.childData.rows) {
+      const len = (row[CHILD_UDT02_ID] || '').length;
+      if (len > codeW) codeW = len;
+    }
+    codeW += 2; // padding
     this.table = new Table({
       head: ['Line', 'Code', 'Description', 'Pay', ...this.dates.map(d => d.format('D'))],
-      colWidths: [6, 14, 20, 5, ...this.dates.slice().fill(5)],
+      colWidths: [6, codeW, 20, 5, ...this.dates.slice().fill(5)],
       colAligns: ['middle', 'left', 'left', 'left', ...this.dates.slice().fill('middle')],
     });
   }
@@ -1544,6 +1824,229 @@ class DirectClient {
       ])),
       this._keepalive(),
     ]);
+  }
+
+  // =========================================================================
+  // Command builders — revision explanation
+  // =========================================================================
+
+  /** Open K2 result set for TMMTS_TS_REVISION_EXP */
+  _buildOpenRevisionRS() {
+    const cmds = [
+      this._wrap(this._cmd(201, [
+        { code: 'K', value: '2' },
+        { code: 'I', value: 'TMMTS_TS_REVISION_EXP' },
+        { code: 'N', value: '22410' },
+        { code: 'P', value: '0' },
+        { code: 'T', value: 'D' },
+        { code: 'X', value: '0' },
+        { name: 'checkCache', value: '0' },
+        { code: 'C', value: '-60000' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /** Query K2 revision data and open K3 (TMMTS_TS_AUDIT_EXP) */
+  _buildQueryRevisionAndOpenAudit() {
+    const cmds = [
+      // 204 K2 positive range (SR type for revision data)
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'SR' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: '0' }, { code: 'K', value: '2' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'nonDBSize', value: '1' }, { name: 'nonDBStart', value: '0' },
+      ])),
+      // 204 K2 negative range
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'SR' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: '0' }, { code: 'K', value: '2' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 201 Open K3 (TMMTS_TS_AUDIT_EXP)
+      this._wrap(this._cmd(201, [
+        { code: 'K', value: '3' },
+        { code: 'I', value: 'TMMTS_TS_AUDIT_EXP' },
+        { code: 'N', value: '22411' },
+        { code: 'P', value: '2' },
+        { code: 'T', value: 'D' },
+        { code: 'X', value: '-60000' },
+        { code: 'C', value: '-60000' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /** Query K3 audit detail data */
+  _buildQueryAudit() {
+    const cmds = [
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: '0' }, { code: 'K', value: '3' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '2' },
+        { code: 'V', value: 'true' },
+        { name: 'nonDBSize', value: '20' }, { name: 'nonDBStart', value: '0' },
+      ])),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: '0' }, { code: 'K', value: '3' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '2' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  // =========================================================================
+  // Command builders — leave balances
+  // =========================================================================
+
+  /** Open K2 result set for TMMTS_LVSTAT_HDR */
+  _buildOpenLeaveBalanceRS() {
+    const cmds = [
+      this._wrap(this._cmd(201, [
+        { code: 'K', value: '2' },
+        { code: 'I', value: 'TMMTS_LVSTAT_HDR' },
+        { code: 'N', value: '17314' },
+        { code: 'P', value: '0' },
+        { code: 'T', value: 'D' },
+        { code: 'X', value: '0' },
+        { name: 'checkCache', value: '0' },
+        { code: 'C', value: '-60000' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /** Query K2 leave balance data and open K3 (TMMTS_LV_STAT) */
+  _buildQueryLeaveBalancesAndOpenDetail() {
+    const cmds = [
+      // 204 K2 positive range
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: '0' }, { code: 'W', value: '' },
+        { code: 'K', value: '2' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'nonDBSize', value: '20' }, { name: 'nonDBStart', value: '0' },
+      ])),
+      // 204 K2 negative range
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: '0' },
+        { name: 'newQry', value: 'Y' },
+        { code: 'K', value: '2' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 201 Open K3 (TMMTS_LV_STAT)
+      this._wrap(this._cmd(201, [
+        { code: 'K', value: '3' },
+        { code: 'I', value: 'TMMTS_LV_STAT' },
+        { code: 'N', value: '17315' },
+        { code: 'P', value: '2' },
+        { code: 'T', value: 'D' },
+        { code: 'X', value: '-60000' },
+        { code: 'C', value: '-60000' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /** Query K3 leave detail data for a specific parent row (leave type) */
+  _buildQueryLeaveDetails(parentRowIdx) {
+    const x = String(parentRowIdx || 0);
+    const cmds = [
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '0' }, { code: 'E', value: '100' },
+        { code: 'X', value: x }, { code: 'W', value: '' },
+        { code: 'K', value: '3' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '2' },
+        { code: 'V', value: 'true' },
+        { name: 'nonDBSize', value: '20' }, { name: 'nonDBStart', value: '0' },
+      ])),
+      this._wrap(this._cmd(204, [
+        { name: 'rsType', value: 'M' }, { code: 'R', value: 'ABS' },
+        { code: 'S', value: '-59999' }, { code: 'E', value: '-59899' },
+        { code: 'X', value: x },
+        { name: 'newQry', value: 'Y' },
+        { code: 'K', value: '3' },
+        { code: 'C', value: '-60000' }, { code: 'P', value: '2' },
+        { code: 'V', value: 'true' },
+      ])),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
+  }
+
+  /** Build the save batch with revision explanation PUT to K2 */
+  _buildRevisionSaveBatch(explanation) {
+    const meta = this._revisionMeta;
+    const rowNum = this._revisionRowNum || '-59999';
+    const revRow = [
+      explanation,
+      String(this._revisionNumber),
+      '', '',
+      'N',
+      meta.emplId,
+      meta.periodNoCd,
+      meta.scheduleCd,
+      meta.year,
+    ];
+    const encodedRow = protocol.encodePutRow(revRow) + protocol.DLM_ROW;
+
+    const cmds = [
+      // 205 PUT K2: select revision row
+      this._wrap(this._cmd(205, [
+        { name: 'rsRowSelectedFlOnly', value: 'true' },
+        { code: 'X', value: '0' }, { code: 'K', value: '2' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+      ]), { data: encodedRow, editFlag: '65619,', rowNumber: rowNum + ',' }),
+      // 205 PUT K2: write explanation data
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '2' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), { data: encodedRow, editFlag: '65619,', rowNumber: rowNum + ',' }),
+      // 205 PUT K2: second data write (replicates browser behavior)
+      this._wrap(this._cmd(205, [
+        { code: 'X', value: '0' }, { code: 'K', value: '2' },
+        { code: 'C', value: rowNum }, { code: 'P', value: '0' },
+        { code: 'V', value: 'true' },
+        { name: 'lastPutId', value: String(this.lastPutId++) },
+      ]), { data: encodedRow, editFlag: '65619,', rowNumber: rowNum + ',' }),
+      // 206 SAVE
+      this._wrap(this._cmd(206, [
+        { code: 'G', value: 'false' }, { code: 'C', value: '0' },
+        { code: 'U', value: 'true' }, { code: 'K', value: '0' },
+        { code: 'V', value: 'true' },
+      ])),
+      // 204 refresh K0 + K1
+      ...this._get204(0),
+      ...this._get204(1),
+      this._keepalive(),
+    ];
+    return protocol.buildRequestBody(this.sid, cmds);
   }
 
   // =========================================================================
@@ -1910,4 +2413,5 @@ class DirectClient {
   }
 }
 
+DirectClient.RevisionRequiredError = RevisionRequiredError;
 module.exports = DirectClient;

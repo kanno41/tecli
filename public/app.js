@@ -28,6 +28,7 @@
       calculateTotals();
       attachEventListeners();
       startStatusPolling();
+      checkThursdayNudge();
     }
   }
 
@@ -162,15 +163,30 @@
       confirmAddProject.addEventListener("click", handleAddProject);
     }
 
-    // Sign timesheet
-    const signBtn = document.getElementById("sign-btn");
+    // Leave balances
+    const leaveBalBtn = document.getElementById("leave-bal-btn");
+    const leaveModal = document.getElementById("leave-modal");
+    if (leaveBalBtn && leaveModal) {
+      leaveBalBtn.addEventListener("click", handleLeaveBalances);
+    }
+
+    // Per-week sign buttons
     const signModal = document.getElementById("sign-modal");
     const confirmSign = document.getElementById("confirm-sign");
-    if (signBtn && signModal) {
-      signBtn.addEventListener("click", () => showModal(signModal));
-    }
+    document.querySelectorAll(".btn-week-sign").forEach(btn => {
+      btn.addEventListener("click", () => showModal(signModal));
+    });
     if (confirmSign) {
       confirmSign.addEventListener("click", handleSign);
+    }
+
+    // Copy Thursday -> Friday buttons
+    document.querySelectorAll(".btn-copy-thu").forEach(btn => {
+      btn.addEventListener("click", handleCopyThursdayToFriday);
+    });
+    const nudgeCopyBtn = document.getElementById("nudge-copy-btn");
+    if (nudgeCopyBtn) {
+      nudgeCopyBtn.addEventListener("click", handleCopyThursdayToFriday);
     }
 
     // Modal close buttons
@@ -311,9 +327,19 @@
         method: "POST"
       });
 
+      const saveResult = await saveResponse.json();
+
       if (!saveResponse.ok) {
-        const errorData = await saveResponse.json();
-        throw new Error(errorData.error || "Failed to save to Costpoint");
+        throw new Error(saveResult.error || "Failed to save to Costpoint");
+      }
+
+      // Check if revision explanation is required
+      if (saveResult.revisionRequired) {
+        updateSyncStatus("idle");
+        saveBtn.textContent = "Save";
+        saveBtn.disabled = false;
+        showRevisionModal(saveResult.auditDetails || []);
+        return;
       }
 
       // Clear pending changes and update UI
@@ -339,6 +365,89 @@
       saveBtn.textContent = "Save";
       updateSaveButton();
     }
+  }
+
+  function showRevisionModal(auditDetails) {
+    // Remove existing modal if any
+    const existing = document.getElementById("revision-modal");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "revision-modal";
+    overlay.className = "modal-overlay";
+
+    let auditHTML = "";
+    if (auditDetails.length > 0) {
+      auditHTML = '<table class="audit-table"><thead><tr>' +
+        "<th>Line</th><th>Date</th><th>Project</th><th>Description</th><th>Change</th>" +
+        "</tr></thead><tbody>" +
+        auditDetails.map(d =>
+          "<tr><td>" + (d.lineNo || "") + "</td><td>" + (d.date || "") +
+          "</td><td>" + (d.project || "") + "</td><td>" + (d.chargeDescription || "") +
+          "</td><td>" + (d.description || "") + "</td></tr>"
+        ).join("") +
+        "</tbody></table>";
+    }
+
+    overlay.innerHTML =
+      '<div class="modal-content">' +
+        "<h3>Revision Explanation Required</h3>" +
+        "<p>Your changes require a revision explanation. Please describe why these changes were made.</p>" +
+        '<div class="audit-section">' + auditHTML + "</div>" +
+        '<textarea id="revision-explanation" rows="3" placeholder="Enter explanation for changes..."></textarea>' +
+        '<div class="modal-buttons">' +
+          '<button id="revision-cancel" class="modal-btn cancel">Cancel</button>' +
+          '<button id="revision-submit" class="modal-btn submit">Continue</button>' +
+        "</div>" +
+      "</div>";
+
+    document.body.appendChild(overlay);
+
+    const textarea = document.getElementById("revision-explanation");
+    textarea.focus();
+
+    document.getElementById("revision-cancel").addEventListener("click", () => {
+      overlay.remove();
+    });
+
+    document.getElementById("revision-submit").addEventListener("click", async () => {
+      const explanation = textarea.value.trim();
+      if (!explanation) {
+        textarea.style.borderColor = "#e74c3c";
+        textarea.placeholder = "Explanation is required!";
+        return;
+      }
+      const submitBtn = document.getElementById("revision-submit");
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Saving...";
+
+      try {
+        const resp = await fetch("/api/save-with-explanation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ explanation })
+        });
+        const result = await resp.json();
+        if (!resp.ok) throw new Error(result.error || "Failed to save");
+
+        // Clear pending changes
+        pendingChanges.forEach((change, key) => {
+          const [line, day] = key.split("-").map(Number);
+          const input = document.querySelector('.hours-input[data-line="' + line + '"][data-day="' + day + '"]');
+          if (input) input.classList.remove("modified");
+          originalValues.set(key, change.hours === "" ? "" : parseFloat(change.hours));
+        });
+        pendingChanges.clear();
+        updateSyncStatus("idle");
+        updateSaveButton();
+        overlay.remove();
+        showSuccess("Changes saved with revision explanation.");
+      } catch (err) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Continue";
+        showError(err.message);
+      }
+    });
   }
 
   async function handleRefresh() {
@@ -394,6 +503,47 @@
     } catch (err) {
       console.error("Clear cache failed:", err);
       showError("Failed to clear cache. Please try again.");
+    }
+  }
+
+  async function handleLeaveBalances() {
+    const leaveModal = document.getElementById("leave-modal");
+    const leaveBody = document.getElementById("leave-modal-body");
+    leaveBody.innerHTML = "<p>Loading leave balances...</p>";
+    showModal(leaveModal);
+
+    try {
+      const response = await fetch("/api/leave");
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to fetch leave balances");
+      }
+      const result = await response.json();
+      let html = "";
+
+      if (result.balances && result.balances.length > 0) {
+        html += '<table class="leave-table"><thead><tr><th>Leave Type</th><th class="num">Balance</th></tr></thead><tbody>';
+        for (const b of result.balances) {
+          const val = b.balance.toFixed(2);
+          const cls = b.balance > 0 ? "positive" : b.balance < 0 ? "negative" : "";
+          html += "<tr><td>" + b.description + "</td><td class=\"num " + cls + "\">" + val + "</td></tr>";
+        }
+        html += "</tbody></table>";
+      } else {
+        html += "<p>No leave balances found.</p>";
+      }
+
+      if (result.details && result.details.length > 0) {
+        html += '<h3>Recent Activity</h3><table class="leave-table"><thead><tr><th>Date</th><th>Type</th><th class="num">Hours</th><th>Leave Type</th></tr></thead><tbody>';
+        for (const d of result.details) {
+          html += "<tr><td>" + d.date + "</td><td>" + d.type + "</td><td class=\"num\">" + d.hours.toFixed(2) + "</td><td>" + (d.leaveTypeDesc || d.leaveTypeCode) + "</td></tr>";
+        }
+        html += "</tbody></table>";
+      }
+
+      leaveBody.innerHTML = html;
+    } catch (err) {
+      leaveBody.innerHTML = '<p class="error">' + (err.message || "Failed to load leave balances") + "</p>";
     }
   }
 
@@ -487,6 +637,79 @@
     }
   }
 
+  // Copy Thursday's hours to Friday for the active week
+  function handleCopyThursdayToFriday() {
+    if (!data || !data.activeDates) return;
+
+    const activeDatesSet = new Set(data.activeDates);
+    var thuDay = null, friDay = null;
+    for (var di = 0; di < data.dates.length; di++) {
+      var d = data.dates[di];
+      if (!activeDatesSet.has(d.fullDate)) continue;
+      if (d.dayOfWeek === 'Thu') thuDay = d.date;
+      if (d.dayOfWeek === 'Fri') friDay = d.date;
+    }
+
+    if (thuDay === null || friDay === null) return;
+
+    var copied = 0;
+    document.querySelectorAll("tbody tr").forEach(function(row) {
+      var thuInput = row.querySelector('.hours-input[data-day="' + thuDay + '"]:not(:disabled)');
+      var friInput = row.querySelector('.hours-input[data-day="' + friDay + '"]:not(:disabled)');
+      if (thuInput && friInput && thuInput.value.trim() !== '') {
+        if (friInput.value.trim() !== thuInput.value.trim()) {
+          friInput.value = thuInput.value;
+          friInput.dispatchEvent(new Event('input', { bubbles: true }));
+          copied++;
+        }
+      }
+    });
+
+    if (copied > 0) {
+      showSuccess('Copied Thursday hours to Friday (' + copied + ' row' + (copied !== 1 ? 's' : '') + ')');
+    } else {
+      showSuccess('Friday already matches Thursday');
+    }
+  }
+
+  // Check if Thursday nudge should be shown
+  function checkThursdayNudge() {
+    if (!data || !data.weeks) return;
+
+    var today = new Date();
+    var dayOfWeek = today.getDay(); // 0=Sun, 4=Thu, 5=Fri
+
+    // Only show nudge on Thursday or Friday
+    if (dayOfWeek !== 4 && dayOfWeek !== 5) return;
+
+    // Find the active week
+    var activeWeek = null;
+    for (var i = 0; i < data.weeks.length; i++) {
+      if (data.weeks[i].isActive) { activeWeek = data.weeks[i]; break; }
+    }
+    if (!activeWeek) return;
+
+    // Only nudge if unsigned
+    if (activeWeek.statusTone !== 'open' && activeWeek.statusTone !== 'missing') return;
+
+    // Check if the active week contains today
+    var todayStr = today.getFullYear() + '-' +
+      String(today.getMonth() + 1).padStart(2, '0') + '-' +
+      String(today.getDate()).padStart(2, '0');
+    if (todayStr < activeWeek.startDate || todayStr > activeWeek.endDate) return;
+
+    var nudge = document.getElementById('thursday-nudge');
+    if (nudge) {
+      var msg = nudge.querySelector('.nudge-message');
+      if (msg) {
+        msg.textContent = dayOfWeek === 4
+          ? "It's Thursday - estimate Friday and sign your timesheet"
+          : "Don't forget to sign this week's timesheet";
+      }
+      nudge.style.display = 'flex';
+    }
+  }
+
   // Status polling
   function startStatusPolling() {
     statusPollingInterval = setInterval(checkStatus, 5000);
@@ -518,8 +741,8 @@
   // UI helpers
   function updateSyncStatus(status) {
     if (syncStatus) {
-      syncStatus.textContent = status;
-      syncStatus.className = `status-badge status-${status}`;
+      syncStatus.className = `sync-dot sync-${status}`;
+      syncStatus.title = status;
     }
   }
 

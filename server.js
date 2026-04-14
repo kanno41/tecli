@@ -37,9 +37,61 @@ if (!useDirect && !system) {
 
 async function launchClient() {
   if (useDirect) {
-    return DirectClient.launch(url, username, password);
+    return DirectClient.launch(url, username, password, { loadPreviousPeriod: true });
   }
   return Costpoint.launch(url, username, password, system);
+}
+
+// Persistent session management — reuse one client across operations
+let activeClient = null;
+let clientIdleTimer = null;
+const CLIENT_IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+async function getClient() {
+  if (clientIdleTimer) clearTimeout(clientIdleTimer);
+
+  if (!activeClient) {
+    console.log('Creating new Costpoint session...');
+    activeClient = await launchClient();
+    console.log('Session established.');
+  } else {
+    console.log('Reusing existing Costpoint session.');
+  }
+
+  clientIdleTimer = setTimeout(releaseClient, CLIENT_IDLE_TIMEOUT);
+  return activeClient;
+}
+
+async function releaseClient() {
+  if (clientIdleTimer) {
+    clearTimeout(clientIdleTimer);
+    clientIdleTimer = null;
+  }
+  if (activeClient) {
+    try { await activeClient.close(); } catch (e) { /* ignore */ }
+    activeClient = null;
+    console.log('Costpoint session released.');
+  }
+}
+
+function isSessionError(e) {
+  const msg = (e.message || '').toLowerCase();
+  return msg.includes('session') || msg.includes('not valid') ||
+         msg.includes('econnreset') || msg.includes('econnrefused') ||
+         msg.includes('socket hang up') || msg.includes('onservletexception');
+}
+
+async function withClient(fn) {
+  try {
+    return await fn(await getClient());
+  } catch (e) {
+    if (isSessionError(e)) {
+      console.log('Session error, retrying with fresh login:', e.message);
+      await releaseClient();
+      return await fn(await getClient());
+    }
+    throw e;
+  }
 }
 
 // Cache file location — stores per-week data keyed by week start date
@@ -82,16 +134,27 @@ function getMergedData() {
   const prevWeek = cachedWeeks[prevStart.format('YYYY-MM-DD')] || null;
   const nextWeek = cachedWeeks[nextStart.format('YYYY-MM-DD')] || null;
 
-  // Determine week1 (earlier) and week2 (later)
+  // Determine week1 (earlier) and week2 (later).
+  // Use payPeriodWeek to place the active week in the correct position
+  // within the biweekly view — otherwise a cached week from a different
+  // pay period can push the active week into the wrong slot.
   let week1Data, week2Data;
-  if (prevWeek) {
+  const ppWeek = activeWeek.payPeriodWeek;
+  if (ppWeek === 1) {
+    // Active is Wk 1 of 2 — show as week1, pair with next week only
+    week1Data = activeWeek;
+    week2Data = nextWeek;
+  } else if (ppWeek === 2) {
+    // Active is Wk 2 of 2 — show as week2, pair with prev week only
+    week1Data = prevWeek;
+    week2Data = activeWeek;
+  } else if (prevWeek) {
     week1Data = prevWeek;
     week2Data = activeWeek;
   } else if (nextWeek) {
     week1Data = activeWeek;
     week2Data = nextWeek;
   } else {
-    // No adjacent week cached — show active as week2 with empty week1
     week1Data = null;
     week2Data = activeWeek;
   }
@@ -150,12 +213,36 @@ function getMergedData() {
     activeLine: p.lines.active,
   }));
 
+  // Per-week metadata for UI
+  const week1StatusMeta = week1Data
+    ? normalizeTimesheetStatus(week1Data.timesheetStatusCode || week1Data.timesheetStatus)
+    : null;
+  const week2StatusMeta = week2Data
+    ? normalizeTimesheetStatus(week2Data.timesheetStatusCode || week2Data.timesheetStatus)
+    : null;
+
   return {
     dates: allDates,
     projects,
     activeDates: Array.from(activeDates),
     timesheetStatus: activeWeek.timesheetStatus,
     timesheetStatusCode: activeWeek.timesheetStatusCode,
+    weeks: [
+      {
+        startDate: allDates[0].fullDate,
+        endDate: allDates[6].fullDate,
+        isActive: week1Data === activeWeek,
+        statusLabel: week1StatusMeta ? week1StatusMeta.label : null,
+        statusTone: week1StatusMeta ? week1StatusMeta.tone : null,
+      },
+      {
+        startDate: allDates[7].fullDate,
+        endDate: allDates[13].fullDate,
+        isActive: week2Data === activeWeek,
+        statusLabel: week2StatusMeta ? week2StatusMeta.label : null,
+        statusTone: week2StatusMeta ? week2StatusMeta.tone : null,
+      },
+    ],
   };
 }
 
@@ -215,38 +302,62 @@ async function saveAllChanges() {
   syncStatus = "syncing";
 
   const changesToSave = Array.from(pendingChanges.values());
-  let cp = null;
 
   try {
-    cp = await launchClient();
+    await withClient(async (cp) => {
+      if (changesToSave.length === 1) {
+        const change = changesToSave[0];
+        await cp.set(change.line, change.day, change.hours);
+      } else {
+        await cp.setm(changesToSave);
+      }
+      await cp.save();
+      storeWeekData(cp.getData());
+      saveCache();
+    });
 
-    // Use setm for multiple changes, set for single change
-    if (changesToSave.length === 1) {
-      const change = changesToSave[0];
-      await cp.set(change.line, change.day, change.hours);
-    } else {
-      await cp.setm(changesToSave);
-    }
-
-    await cp.save();
-
-    // Update cache with fresh data
-    storeWeekData(cp.getData());
-    saveCache();
     pendingChanges.clear();
-
     lastError = null;
     syncStatus = "idle";
     return { success: true, message: `Saved ${changesToSave.length} changes` };
   } catch (e) {
+    if (e.name === 'RevisionRequiredError') {
+      syncStatus = "idle";
+      isProcessing = false;
+      return { revisionRequired: true, auditDetails: e.auditDetails };
+    }
     console.error("Save failed:", e.message);
     lastError = e.message;
     syncStatus = "error";
     throw e;
   } finally {
-    if (cp) {
-      await cp.close();
-    }
+    isProcessing = false;
+  }
+}
+
+async function saveWithExplanation(explanation) {
+  if (isProcessing) throw new Error("Another operation is in progress");
+
+  isProcessing = true;
+  syncStatus = "syncing";
+
+  try {
+    await withClient(async (cp) => {
+      await cp.saveWithExplanation(explanation);
+      storeWeekData(cp.getData());
+      saveCache();
+    });
+
+    pendingChanges.clear();
+    lastError = null;
+    syncStatus = "idle";
+    return { success: true, message: "Saved with revision explanation" };
+  } catch (e) {
+    console.error("Save with explanation failed:", e.message);
+    lastError = e.message;
+    syncStatus = "error";
+    throw e;
+  } finally {
     isProcessing = false;
   }
 }
@@ -258,14 +369,13 @@ async function addProject(code, payType) {
   isProcessing = true;
   syncStatus = "syncing";
 
-  let cp = null;
   try {
-    cp = await launchClient();
-    await cp.add(code, payType);
-    await cp.save();
-
-    storeWeekData(cp.getData());
-    saveCache();
+    await withClient(async (cp) => {
+      await cp.add(code, payType);
+      await cp.save();
+      storeWeekData(cp.getData());
+      saveCache();
+    });
 
     lastError = null;
     syncStatus = "idle";
@@ -276,9 +386,6 @@ async function addProject(code, payType) {
     syncStatus = "error";
     throw e;
   } finally {
-    if (cp) {
-      await cp.close();
-    }
     isProcessing = false;
   }
 }
@@ -290,13 +397,12 @@ async function signTimesheet() {
   isProcessing = true;
   syncStatus = "syncing";
 
-  let cp = null;
   try {
-    cp = await launchClient();
-    await cp.sign();
-
-    storeWeekData(cp.getData());
-    saveCache();
+    await withClient(async (cp) => {
+      await cp.sign();
+      storeWeekData(cp.getData());
+      saveCache();
+    });
 
     lastError = null;
     syncStatus = "idle";
@@ -307,9 +413,6 @@ async function signTimesheet() {
     syncStatus = "error";
     throw e;
   } finally {
-    if (cp) {
-      await cp.close();
-    }
     isProcessing = false;
   }
 }
@@ -320,31 +423,37 @@ async function fetchFreshData() {
 
   isProcessing = true;
   syncStatus = "loading";
-  let cp = null;
+
   try {
-    cp = await launchClient();
+    // Release existing session — we want fresh data from server
+    await releaseClient();
+
+    const cp = await getClient();
 
     // Store current week
     const currentWeek = cp.getData();
     storeWeekData(currentWeek);
 
-    // Navigate to the other week of the pay period.
-    // The real Costpoint "Previous" button re-inits the app, and the server
-    // moves the cursor to the previous period. For a biweekly schedule,
-    // if we're on Wk 2 this gives us Wk 1; if on Wk 1 it gives us the
-    // prior pay period's Wk 2. Either way, we cache whatever we get.
+    // Get previous period data without mutating client state (keeps
+    // the session usable for subsequent save/sign operations)
     try {
-      await cp.navigateToPreviousPeriod();
-      const otherWeek = cp.getData();
-      const otherKey = weekStartKey(otherWeek);
-      if (otherKey) {
-        cachedWeeks[otherKey] = otherWeek;
+      if (typeof cp.getPreviousPeriodData === 'function') {
+        const otherWeek = cp.getPreviousPeriodData();
+        if (otherWeek) {
+          const otherKey = weekStartKey(otherWeek);
+          if (otherKey) cachedWeeks[otherKey] = otherWeek;
+        }
+      } else {
+        // Fallback for Puppeteer client — uses navigateToPreviousPeriod
+        await cp.navigateToPreviousPeriod();
+        const otherWeek = cp.getData();
+        const otherKey = weekStartKey(otherWeek);
+        if (otherKey) cachedWeeks[otherKey] = otherWeek;
       }
     } catch (navErr) {
       console.error("Failed to fetch other period (non-fatal):", navErr.message);
     }
 
-    // activeWeekStart stays on the current week
     activeWeekStart = weekStartKey(currentWeek);
 
     saveCache();
@@ -357,9 +466,6 @@ async function fetchFreshData() {
     syncStatus = "error";
     throw e;
   } finally {
-    if (cp) {
-      await cp.close();
-    }
     isProcessing = false;
   }
 }
@@ -401,6 +507,16 @@ function renderHTML(data, isLoading = false) {
     ? `Raw status code: ${timesheetStatusMeta.code}`
     : "Raw status unavailable";
 
+  const weeksInfo = hasData && data.weeks ? data.weeks.map((w, i) => {
+    const dates = data.dates.slice(i * 7, i * 7 + 7);
+    const start = moment(dates[0].fullDate);
+    const end = moment(dates[6].fullDate);
+    const label = start.month() === end.month()
+      ? start.format('MMM D') + '\u2013' + end.format('D')
+      : start.format('MMM D') + ' \u2013 ' + end.format('MMM D');
+    return Object.assign({}, w, { label: label });
+  }) : [];
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -415,7 +531,7 @@ function renderHTML(data, isLoading = false) {
       <img src="/deltek.png" alt="Str8 Outta Deltek" class="logo" />
       <div class="status-container">
         <div class="status-badges">
-          <span id="sync-status" class="status-badge status-${currentStatus}">${currentStatus}</span>
+          <span id="sync-status" class="sync-dot sync-${currentStatus}" title="${currentStatus}"></span>
           ${timesheetStatusMeta ? `
           <span
             id="timesheet-status"
@@ -445,17 +561,36 @@ function renderHTML(data, isLoading = false) {
       <span class="period-dates">${periodStart.dayOfWeek} ${periodStart.fullDate} - ${periodEnd.dayOfWeek} ${periodEnd.fullDate}</span>
     </div>
 
+    <div id="thursday-nudge" class="thursday-nudge" style="display: none;">
+      <span class="nudge-message"></span>
+      <button id="nudge-copy-btn" class="btn btn-secondary btn-sm">Copy Thu &rarr; Fri</button>
+    </div>
+
     <div class="timesheet-wrapper">
       <table class="timesheet" id="timesheet">
         <thead>
+          <tr class="week-header-row">
+            <th colspan="4" class="week-header-spacer"></th>
+            ${weeksInfo.map(w => {
+              const canSign = w.isActive && (w.statusTone === 'open' || w.statusTone === 'missing');
+              return `<th colspan="7" class="week-header ${w.isActive ? 'week-active' : 'week-inactive'}">
+                <div class="week-header-content">
+                  <span class="week-dates">${w.label}</span>
+                  ${w.statusLabel ? `<span class="week-status-badge timesheet-status-${w.statusTone}">${w.statusLabel}</span>` : ''}
+                  ${canSign ? '<button class="btn-copy-thu" title="Copy Thursday hours to Friday">Thu &rarr; Fri</button><button class="btn-week-sign">Sign</button>' : ''}
+                </div>
+              </th>`;
+            }).join("")}
+            <th class="week-header-spacer"></th>
+          </tr>
           <tr>
             <th class="col-line">#</th>
             <th class="col-code">Code</th>
             <th class="col-desc">Description</th>
             <th class="col-pay">Pay</th>
-            ${data.dates.map(d => {
+            ${data.dates.map((d, i) => {
               const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
-              return `<th class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'}"><div class="day-header"><span class="day-name">${d.dayOfWeek}</span><span class="day-num">${d.date}</span></div></th>`;
+              return `<th class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'}${i === 6 ? ' week-divider' : ''}"><div class="day-header"><span class="day-name">${d.dayOfWeek}</span><span class="day-num">${d.date}</span></div></th>`;
             }).join("")}
             <th class="col-total">Total</th>
           </tr>
@@ -467,13 +602,13 @@ function renderHTML(data, isLoading = false) {
             <td class="col-code" title="${project.code || ''}">${project.code || ''}</td>
             <td class="col-desc" title="${project.description}">${project.description}</td>
             <td class="col-pay">${project.payType || ''}</td>
-            ${data.dates.map(d => {
+            ${data.dates.map((d, i) => {
               const hours = project.hours[d.date];
               const displayValue = hours !== null && hours !== undefined ? hours : "";
               const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
               const isActive = activeDatesSet.has(d.fullDate);
               const disabled = !isActive ? 'disabled' : '';
-              return `<td class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'} ${!isActive ? 'col-inactive' : ''}"><input type="text" class="hours-input ${!isActive ? 'inactive' : ''}" data-line="${project.line}" data-active-line="${isActive ? (project.activeLine != null ? project.activeLine : '') : ''}" data-day="${d.date}" data-fulldate="${d.fullDate}" value="${displayValue}" ${disabled} /></td>`;
+              return `<td class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'} ${!isActive ? 'col-inactive' : ''}${i === 6 ? ' week-divider' : ''}"><input type="text" class="hours-input ${!isActive ? 'inactive' : ''}" data-line="${project.line}" data-active-line="${isActive ? (project.activeLine != null ? project.activeLine : '') : ''}" data-day="${d.date}" data-fulldate="${d.fullDate}" value="${displayValue}" ${disabled} /></td>`;
             }).join("")}
             <td class="col-total row-total">0</td>
           </tr>
@@ -485,9 +620,9 @@ function renderHTML(data, isLoading = false) {
             <td class="col-code"></td>
             <td class="col-desc">Daily Total</td>
             <td class="col-pay"></td>
-            ${data.dates.map(d => {
+            ${data.dates.map((d, i) => {
               const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
-              return `<td class="col-day daily-total ${isWeekend ? 'col-weekend' : 'col-weekday'}" data-day="${d.date}">0</td>`;
+              return `<td class="col-day daily-total ${isWeekend ? 'col-weekend' : 'col-weekday'}${i === 6 ? ' week-divider' : ''}" data-day="${d.date}">0</td>`;
             }).join("")}
             <td class="col-total grand-total">0</td>
           </tr>
@@ -497,17 +632,53 @@ function renderHTML(data, isLoading = false) {
 
     <div class="actions">
       <button id="add-project-btn" class="btn btn-secondary">+ Add Project</button>
+      <button id="leave-bal-btn" class="btn btn-secondary">Leave Balances</button>
       <div class="actions-right">
         <span id="unsaved-indicator" class="unsaved-indicator" style="display: none;">Unsaved changes</span>
         <button id="save-btn" class="btn btn-success" disabled>Save</button>
-        <button id="sign-btn" class="btn btn-primary">Sign Timesheet</button>
       </div>
     </div>
     ` : `
-    <div class="loading-container" id="loading-container">
-      <div class="loading-spinner"></div>
-      <p>Loading timesheet from Costpoint...</p>
-      <p class="loading-hint">This may take a moment on first load</p>
+    <div class="skeleton-period-info"><div class="skel-bone skel-w40"></div></div>
+    <div class="timesheet-wrapper">
+      <table class="timesheet skeleton-table">
+        <thead>
+          <tr class="week-header-row">
+            <th colspan="4" class="week-header-spacer"></th>
+            <th colspan="7" class="week-header"><div class="skel-bone skel-w60"></div></th>
+            <th colspan="7" class="week-header"><div class="skel-bone skel-w60"></div></th>
+            <th class="week-header-spacer"></th>
+          </tr>
+          <tr>
+            <th class="col-line"><div class="skel-bone skel-w100"></div></th>
+            <th class="col-code"><div class="skel-bone skel-w100"></div></th>
+            <th class="col-desc"><div class="skel-bone skel-w80"></div></th>
+            <th class="col-pay"><div class="skel-bone skel-w100"></div></th>
+            ${Array.from({length: 14}, (_, i) => `<th class="col-day${i === 6 ? ' week-divider' : ''}"><div class="skel-bone-circle"></div></th>`).join('')}
+            <th class="col-total"><div class="skel-bone skel-w100"></div></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${Array.from({length: 6}, () => `<tr>
+            <td class="col-line"><div class="skel-bone skel-w60"></div></td>
+            <td class="col-code"><div class="skel-bone skel-w80"></div></td>
+            <td class="col-desc"><div class="skel-bone skel-w70"></div></td>
+            <td class="col-pay"><div class="skel-bone skel-w60"></div></td>
+            ${Array.from({length: 14}, (_, i) => `<td class="col-day${i === 6 ? ' week-divider' : ''}"><div class="skel-bone skel-cell"></div></td>`).join('')}
+            <td class="col-total"><div class="skel-bone skel-w60"></div></td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot>
+          <tr class="totals-row">
+            <td class="col-line"></td>
+            <td class="col-code"></td>
+            <td class="col-desc"><div class="skel-bone skel-w60"></div></td>
+            <td class="col-pay"></td>
+            ${Array.from({length: 14}, (_, i) => `<td class="col-day${i === 6 ? ' week-divider' : ''}"><div class="skel-bone skel-w60"></div></td>`).join('')}
+            <td class="col-total"><div class="skel-bone skel-w80"></div></td>
+          </tr>
+        </tfoot>
+      </table>
     </div>
     `}
 
@@ -564,6 +735,22 @@ function renderHTML(data, isLoading = false) {
     </div>
   </div>
 
+  <!-- Leave Balances Modal -->
+  <div id="leave-modal" class="modal" style="display: none;">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h2>Leave Balances</h2>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body" id="leave-modal-body">
+        <p>Loading...</p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary modal-cancel">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     window.TIMESHEET_DATA = ${hasData ? JSON.stringify(data) : 'null'};
     window.IS_LOADING = ${isLoading};
@@ -576,15 +763,8 @@ function renderHTML(data, isLoading = false) {
 // Routes
 app.get("/", (req, res) => {
   const mergedData = getMergedData();
-  // Always render immediately - show loading state if no data
-  const isLoading = !mergedData && (isFetchingInitialData || !isProcessing);
-
-  // Start background fetch if no data and not already fetching
-  if (!mergedData && !isFetchingInitialData && !isProcessing) {
-    fetchFreshDataInBackground();
-  }
-
-  res.send(renderHTML(mergedData, isLoading || isFetchingInitialData));
+  const isLoading = !mergedData && isFetchingInitialData;
+  res.send(renderHTML(mergedData, isLoading));
 });
 
 app.get("/api/status", (req, res) => {
@@ -642,6 +822,19 @@ app.post("/api/save", async (req, res) => {
   }
 });
 
+app.post("/api/save-with-explanation", async (req, res) => {
+  const { explanation } = req.body;
+  if (!explanation || !explanation.trim()) {
+    return res.status(400).json({ error: "Revision explanation is required" });
+  }
+  try {
+    const result = await saveWithExplanation(explanation.trim());
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/project", async (req, res) => {
   const { code, payType } = req.body;
 
@@ -683,6 +876,17 @@ app.get("/api/refresh", async (req, res) => {
   }
 });
 
+app.get("/api/leave", async (req, res) => {
+  try {
+    const result = await withClient(async (cp) => {
+      return await cp.getLeaveBalances();
+    });
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.delete("/api/cache", (req, res) => {
   try {
     cachedWeeks = {};
@@ -697,15 +901,9 @@ app.delete("/api/cache", (req, res) => {
   }
 });
 
-// Initialize and start server
-loadCache();
-
+// Initialize and start server — fetch fresh data immediately on boot
 app.listen(PORT, () => {
   console.log(`Costpoint Web UI running at http://localhost:${PORT}`);
-  const weekCount = Object.keys(cachedWeeks).length;
-  if (weekCount > 0) {
-    console.log(`Using cached data (${weekCount} week(s)) - timesheet will load instantly`);
-  } else {
-    console.log("No cache found - will fetch from Costpoint on first request");
-  }
+  console.log("Fetching data from Costpoint...");
+  fetchFreshDataInBackground();
 });
