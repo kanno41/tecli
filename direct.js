@@ -120,15 +120,24 @@ class DirectClient {
       if (match) {
         const name = match[1];
         const value = match[2];
-        // Check for Expires in the past — this means "delete the cookie"
-        const expiresMatch = sc.match(/;\s*Expires=([^;]+)/i);
-        if (expiresMatch) {
-          const expiresDate = new Date(expiresMatch[1]);
-          if (expiresDate.getTime() < Date.now()) {
-            if (name in jar) {
-              delete jar[name];
-            }
+        // Check for cookie deletion (RFC 6265: Max-Age=0 or Expires in the past).
+        // Max-Age takes precedence over Expires per spec — important when client
+        // clock is skewed relative to the server.
+        const maxAgeMatch = sc.match(/;\s*Max-Age=(\d+)/i);
+        if (maxAgeMatch) {
+          if (maxAgeMatch[1] === '0') {
+            delete jar[name];
             continue;
+          }
+          // Max-Age > 0 — cookie is valid, skip Expires check
+        } else {
+          const expiresMatch = sc.match(/;\s*Expires=([^;]+)/i);
+          if (expiresMatch) {
+            const expiresDate = new Date(expiresMatch[1]);
+            if (expiresDate.getTime() < Date.now()) {
+              delete jar[name];
+              continue;
+            }
           }
         }
         // Extract explicit Path from Set-Cookie
