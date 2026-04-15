@@ -31,6 +31,75 @@ te tui                         # start the interactive terminal UI
 te logout                      # remove stored credentials
 ```
 
+## MCP Server
+
+The MCP server exposes timesheet tools to AI assistants like Claude. It uses stdio transport and the same credential system as the CLI.
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `show_timesheet` | Show current timesheet with hours, status, and comments |
+| `set_hours` | Set hours for a specific line and day |
+| `set_hours_bulk` | Set hours for multiple cells at once |
+| `add_project` | Add a charge code (supports shortcuts: `pto`, `flex`, `personal`, `holiday`, `lwop`, `holdefer`) |
+| `sign_timesheet` | Sign/submit the timesheet |
+| `get_leave_balances` | Show leave balances and recent activity |
+| `save_with_explanation` | Save with a revision explanation (when required) |
+
+### Installing in Claude Code
+
+```bash
+claude mcp add tecli -- node /path/to/tecli/mcp-server.js
+```
+
+Replace `/path/to/tecli` with the actual path to this repo. For example:
+
+```bash
+claude mcp add tecli -- node ~/dev/tecli/mcp-server.js
+```
+
+To verify it was added:
+
+```bash
+claude mcp list
+```
+
+### Installing in Claude Desktop
+
+Add to your Claude Desktop config file:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "tecli": {
+      "command": "node",
+      "args": ["/path/to/tecli/mcp-server.js"]
+    }
+  }
+}
+```
+
+### Installing in other MCP clients
+
+The server uses stdio transport. Point your client at:
+
+```
+node /path/to/tecli/mcp-server.js
+```
+
+### Credentials
+
+The MCP server uses the same credential resolution as the CLI:
+
+1. Stored credentials from `te login` (`~/.tecli.json` + OS keychain)
+2. Environment variables (`COSTPOINT_URL`, `COSTPOINT_USERNAME`, `COSTPOINT_PASSWORD`)
+
+If you haven't run `te login` yet, do that first — the MCP server picks up stored credentials automatically.
+
 ## Disclaimer
 
 This repository is not affiliated, associated, authorized, endorsed by, or in any way officially connected with Deltek, Inc.
