@@ -37,18 +37,21 @@ const platform = os.platform();
 function keychainGet(account) {
   if (platform === 'darwin') return _macGet(account);
   if (platform === 'linux') return _linuxGet(account);
+  if (platform === 'win32') return _winGet(account);
   return _fallbackGet(account);
 }
 
 function keychainSet(account, password) {
   if (platform === 'darwin') return _macSet(account, password);
   if (platform === 'linux') return _linuxSet(account, password);
+  if (platform === 'win32') return _winSet(account, password);
   return _fallbackSet(account, password);
 }
 
 function keychainDelete(account) {
   if (platform === 'darwin') return _macDelete(account);
   if (platform === 'linux') return _linuxDelete(account);
+  if (platform === 'win32') return _winDelete();
   return _fallbackDelete();
 }
 
@@ -110,6 +113,44 @@ function _linuxDelete(account) {
     ], { stdio: ['pipe', 'pipe', 'pipe'] });
   } catch { /* ignore */ }
   _fallbackDelete(); // clean up any fallback file too
+}
+
+// ── Windows: DPAPI via PowerShell ────────────────────────────────
+// ConvertTo/From-SecureString uses Windows Data Protection API,
+// which ties encryption to the current user + machine — similar
+// security model to macOS Keychain.  Encrypted blob is stored in
+// ~/.tecli-credentials alongside the account name.
+
+function _winGet(account) {
+  try {
+    const data = JSON.parse(fs.readFileSync(CRED_PATH, 'utf8'));
+    if (data.account !== account || !data.dpapi) return null;
+    return execFileSync('powershell.exe', ['-NoProfile', '-Command',
+      '$secure = ConvertTo-SecureString \'' + data.dpapi + '\'; ' +
+      '$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure); ' +
+      '[Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)'
+    ], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function _winSet(account, password) {
+  try {
+    const encrypted = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+      '$pw = ($input | Out-String).TrimEnd(); ' +
+      '$secure = ConvertTo-SecureString $pw -AsPlainText -Force; ' +
+      'ConvertFrom-SecureString $secure'
+    ], { input: password, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    fs.writeFileSync(CRED_PATH, JSON.stringify({ account, dpapi: encrypted }, null, 2) + '\n');
+  } catch {
+    // PowerShell unavailable — fall back to AES
+    _fallbackSet(account, password);
+  }
+}
+
+function _winDelete() {
+  try { fs.unlinkSync(CRED_PATH); } catch { /* ignore */ }
 }
 
 // ── Fallback: AES-256-GCM encrypted file ────────────────────────

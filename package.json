@@ -15,10 +15,10 @@
     "timesheet",
     "time-entry"
   ],
-  "author": "Aaron Ang <awz.ang@gmail.com>",
+  "author": "Ken H <kanno41@gmail.com>",
   "license": "MIT",
   "engines": {
-    "node": ">=7.6.0"
+    "node": ">=18"
   },
   "dependencies": {
     "chalk": "^4.1.2",

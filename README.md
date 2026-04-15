@@ -4,9 +4,11 @@ Time entry CLI, web UI, and TUI for Costpoint.
 
 ## Setup
 
+Requires [Node.js](https://nodejs.org/) 18 or later.
+
 ```bash
 git clone <repo-url>
-cd costpoint
+cd tecli
 npm install
 npm link
 te login
