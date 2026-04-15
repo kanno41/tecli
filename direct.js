@@ -749,8 +749,11 @@ class DirectClient {
 
     // Select the charge row
     let selectedIdx;
-    if (k2Data.rows.length === 1) {
-      // Single-charge code — auto-select
+    const availablePayTypes = k2Data.rows.map(r => r[15] || '');
+    const hasDistinctPayTypes = availablePayTypes.some(pt => pt !== '');
+    debug('K2 lookup for ' + code + ': ' + k2Data.rows.length + ' rows, pay types: [' + availablePayTypes.map(p => p || '(empty)').join(', ') + ']');
+    if (k2Data.rows.length === 1 || !hasDistinctPayTypes) {
+      // Single-charge code or all rows have empty pay types — auto-select first
       selectedIdx = 0;
     } else if (payType) {
       // Multi-charge — find the row matching the desired pay type
@@ -758,13 +761,14 @@ class DirectClient {
       if (selectedIdx < 0) {
         throw new Error(
           'Pay type ' + payType + ' not found for ' + code + '. ' +
-          'Lookup returned ' + k2Data.rows.length + ' options.'
+          'Available: ' + availablePayTypes.join(', ')
         );
       }
     } else {
       throw new Error(
         'Multiple charges found for ' + code + '. ' +
-        'Specify a pay type: te add ' + code + ' REG'
+        'Available pay types: ' + availablePayTypes.join(', ') + '. ' +
+        'Specify one: te add ' + code + ' <payType>'
       );
     }
 

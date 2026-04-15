@@ -9,6 +9,7 @@ const moment = require("moment");
 const Costpoint = require("./costpoint");
 const DirectClient = require("./direct");
 const { normalizeTimesheetStatus } = require("./timesheet-status");
+const { COMMON_CODES } = require("./charge-codes");
 const { getCredentials } = require("./credentials");
 
 require("dotenv").config();
@@ -696,6 +697,15 @@ function renderHTML(data, isLoading = false) {
         <button class="modal-close">&times;</button>
       </div>
       <div class="modal-body">
+        <div class="quick-picks">
+          <label>Common Leave Codes:</label>
+          <div class="quick-pick-grid">
+            ${COMMON_CODES.map(c =>
+              `<button class="btn btn-quick-pick" data-code="${c.code}" data-paytype="${c.payType}"${c.note ? ` title="${c.note}"` : ""}>${c.label}</button>`
+            ).join("\n            ")}
+          </div>
+        </div>
+        <div class="modal-divider"><span>or enter manually</span></div>
         <div class="modal-field">
           <label for="project-code">Project Code:</label>
           <input type="text" id="project-code" placeholder="Enter project code..." />

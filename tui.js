@@ -10,6 +10,7 @@ const DirectClient = require('./direct');
 const Costpoint = require('./costpoint');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
 const { getCredentials } = require('./credentials');
+const { COMMON_CODES } = require('./charge-codes');
 
 require('dotenv').config();
 
@@ -123,7 +124,8 @@ function isCommentRequired(code) { return COMMENT_REQUIRED_CODES.includes(code);
 let data = null;
 let cursorRow = 0;
 let cursorCol = 0;
-let mode = 'navigate'; // navigate | edit | prompt
+let mode = 'navigate'; // navigate | edit | prompt | menu
+let menuItems = null;   // set when mode === 'menu'
 let editBuffer = '';
 let promptLabel = '';
 let promptBuffer = '';
@@ -556,18 +558,31 @@ function render() {
     );
   }
 
-  // ── Fill to bottom ──
-  while (lines.length < H - 3) lines.push('');
-
   // ── Footer ──
-  lines.push('');
-  if (mode === 'prompt') {
-    lines.push(chalk.cyan(promptLabel + promptBuffer + '\u2588'));
+  if (mode === 'menu') {
+    const menuLines = [];
+    menuLines.push(chalk.cyan.bold('Add Project:'));
+    for (let i = 0; i < COMMON_CODES.length; i++) {
+      const c = COMMON_CODES[i];
+      const note = c.note ? chalk.dim('  (' + c.note + ')') : '';
+      menuLines.push('  ' + chalk.yellow(String(i + 1)) + '  ' + c.label + chalk.dim(' — ' + c.code) + note);
+    }
+    menuLines.push('  ' + chalk.yellow('0') + '  Custom code...');
+    menuLines.push(chalk.dim('Press number to select, Esc to cancel'));
+    const footerHeight = menuLines.length + 1; // +1 for status line
+    while (lines.length < H - footerHeight) lines.push('');
+    lines.push(...menuLines);
   } else {
-    if (showLeave) {
-      lines.push(chalk.dim('[l]eave back  [r]efresh  [q]uit'));
+    while (lines.length < H - 3) lines.push('');
+    lines.push('');
+    if (mode === 'prompt') {
+      lines.push(chalk.cyan(promptLabel + promptBuffer + '\u2588'));
     } else {
-      lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [c]opy Thu\u2192Fri  [l]eave  [q]uit'));
+      if (showLeave) {
+        lines.push(chalk.dim('[l]eave back  [r]efresh  [q]uit'));
+      } else {
+        lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [c]opy Thu\u2192Fri  [l]eave  [q]uit'));
+      }
     }
   }
   lines.push(statusMsg || chalk.dim('Ready' + (activeClient ? ' \u2022 session active' : '')));
@@ -589,6 +604,7 @@ function handleKeypress(str, key) {
   if (key.ctrl && key.name === 'c') { shutdown(); return; }
   if (isProcessing) return;
 
+  if (mode === 'menu') return handleMenuKey(str, key);
   if (mode === 'prompt') return handlePromptKey(str, key);
   if (mode === 'edit') return handleEditKey(str, key);
   handleNavigateKey(str, key);
@@ -646,12 +662,7 @@ function handleNavigateKey(str, key) {
       }
       if (str === 'r') { fetchData(); return; }
       if (str === 'a') {
-        enterPrompt('Project code: ', function(code) {
-          if (!code.trim()) return;
-          enterPrompt('Pay type [REG]: ', function(pt) {
-            doAddProject(code.trim(), pt.trim() || 'REG');
-          });
-        });
+        enterMenu();
         return;
       }
       if (str === 'C' || (str === 'c' && key.shift)) {
@@ -774,6 +785,42 @@ function commitComment(text) {
   // Update cached data so the indicator shows immediately
   if (project.comments) {
     project.comments[day] = text || null;
+  }
+}
+
+function enterMenu() {
+  mode = 'menu';
+  menuItems = COMMON_CODES;
+  render();
+}
+
+function handleMenuKey(str, key) {
+  if (key.name === 'escape') {
+    mode = 'navigate';
+    menuItems = null;
+    render();
+    return;
+  }
+  // '0' or 'c' = custom entry
+  if (str === '0' || str === 'c') {
+    mode = 'navigate';
+    menuItems = null;
+    enterPrompt('Project code: ', function(code) {
+      if (!code.trim()) return;
+      enterPrompt('Pay type [REG]: ', function(pt) {
+        doAddProject(code.trim(), pt.trim() || 'REG');
+      });
+    });
+    return;
+  }
+  // Digit 1-N selects a common code
+  const n = parseInt(str, 10);
+  if (n >= 1 && n <= COMMON_CODES.length) {
+    const pick = COMMON_CODES[n - 1];
+    mode = 'navigate';
+    menuItems = null;
+    doAddProject(pick.code, pick.payType);
+    return;
   }
 }
 

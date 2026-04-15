@@ -188,6 +188,15 @@
     if (confirmAddProject) {
       confirmAddProject.addEventListener("click", handleAddProject);
     }
+    document.querySelectorAll(".btn-quick-pick").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const code = btn.dataset.code;
+        const payType = btn.dataset.paytype;
+        document.getElementById("project-code").value = code;
+        document.getElementById("project-pay-type").value = payType;
+        handleAddProject();
+      });
+    });
 
     // Leave balances
     const leaveBalBtn = document.getElementById("leave-bal-btn");

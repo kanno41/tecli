@@ -10,6 +10,7 @@ const readline = require("readline");
 const ora = require("ora");
 const { normalizeTimesheetStatus } = require("./timesheet-status");
 const { getCredentials, login, logout } = require("./credentials");
+const { COMMON_CODES, resolveAlias } = require("./charge-codes");
 
 require("dotenv").config();
 
@@ -298,10 +299,19 @@ program
 program
   .command("add <code> [payType]")
   .description(
-    "add project code to timesheet (payType: REG, RHB, etc. for multi-charge codes)",
+    "add project code to timesheet\n" +
+    "  Shortcuts: " + COMMON_CODES.map(c => c.alias).join(", ") + "\n" +
+    "  e.g. 'te add pto' → ZLEAVE.CMP (REG)",
   )
   .action(async (code, payType) => {
     try {
+      // Resolve shortcut aliases (e.g. "pto" → ZLEAVE.CMP + REG)
+      const alias = resolveAlias(code);
+      if (alias) {
+        if (!payType) payType = alias.payType;
+        code = alias.code;
+      }
+
       const cp = await connect();
 
       const label = payType ? `${code} (${payType})` : code;

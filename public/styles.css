@@ -728,6 +728,56 @@ thead .col-weekend {
   margin-top: 12px;
 }
 
+.quick-picks label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.quick-pick-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btn-quick-pick {
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-quick-pick:hover {
+  background: var(--color-surface);
+  border-color: var(--color-accent);
+}
+
+.modal-divider {
+  display: flex;
+  align-items: center;
+  margin: 16px 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.modal-divider::before,
+.modal-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-border);
+}
+
+.modal-divider span {
+  padding: 0 12px;
+}
+
 .modal-footer {
   display: flex;
   justify-content: flex-end;
