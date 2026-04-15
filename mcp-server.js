@@ -89,7 +89,7 @@ function formatTimesheet(data) {
 // ── MCP Server ─────────────────────────────────────────────────
 
 const server = new McpServer({
-  name: 'costpoint',
+  name: 'tecli',
   version: '1.0.0',
 });
 
