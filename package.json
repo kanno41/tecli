@@ -7,7 +7,8 @@
   },
   "scripts": {
     "server": "node cli.js server",
-    "tui": "node cli.js tui"
+    "tui": "node cli.js tui",
+    "mcp": "node mcp-server.js"
   },
   "keywords": [
     "cli",
@@ -21,6 +22,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "chalk": "^4.1.2",
     "cli-table": "^0.3.11",
     "commander": "^12.1.0",
