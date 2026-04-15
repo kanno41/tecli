@@ -9,31 +9,26 @@ const moment = require("moment");
 const Costpoint = require("./costpoint");
 const DirectClient = require("./direct");
 const { normalizeTimesheetStatus } = require("./timesheet-status");
+const { getCredentials } = require("./credentials");
 
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const url = process.env.COSTPOINT_URL;
-const username = process.env.COSTPOINT_USERNAME;
-const password = process.env.COSTPOINT_PASSWORD;
-const system = process.env.COSTPOINT_SYSTEM;
-const useDirect = process.env.COSTPOINT_DIRECT === 'true';
-
-if (!url || !username || !password) {
-  console.error(
-    "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD are set in the environment."
-  );
+const creds = getCredentials();
+if (!creds) {
+  console.error("No credentials found. Run `te login` to set up.");
   process.exit(1);
 }
-
-if (!useDirect && !system) {
+if (!creds.useDirect && !creds.system) {
   console.error(
     "COSTPOINT_SYSTEM is required when not using direct mode. Set COSTPOINT_DIRECT=true for direct protocol."
   );
   process.exit(1);
 }
+
+const { url, username, password, system, useDirect } = creds;
 
 async function launchClient() {
   if (useDirect) {
@@ -187,6 +182,7 @@ function getMergedData() {
           description: p.description,
           payType: p.payType,
           hours: {},
+          comments: {},
           lines: {},
         });
       }
@@ -196,6 +192,7 @@ function getMergedData() {
         merged.description = p.description;
       }
       Object.assign(merged.hours, p.hours);
+      if (p.comments) Object.assign(merged.comments, p.comments);
       merged.lines[weekLabel] = p.line;
     }
   }
@@ -210,6 +207,7 @@ function getMergedData() {
     description: p.description,
     payType: p.payType,
     hours: p.hours,
+    comments: p.comments,
     activeLine: p.lines.active,
   }));
 
@@ -307,7 +305,7 @@ async function saveAllChanges() {
     await withClient(async (cp) => {
       if (changesToSave.length === 1) {
         const change = changesToSave[0];
-        await cp.set(change.line, change.day, change.hours);
+        await cp.set(change.line, change.day, change.hours, change.comment);
       } else {
         await cp.setm(changesToSave);
       }
@@ -605,10 +603,12 @@ function renderHTML(data, isLoading = false) {
             ${data.dates.map((d, i) => {
               const hours = project.hours[d.date];
               const displayValue = hours !== null && hours !== undefined ? hours : "";
+              const comment = (project.comments && project.comments[d.date]) || "";
+              const escapedComment = comment.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
               const isWeekend = d.dayOfWeek === 'Sat' || d.dayOfWeek === 'Sun';
               const isActive = activeDatesSet.has(d.fullDate);
               const disabled = !isActive ? 'disabled' : '';
-              return `<td class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'} ${!isActive ? 'col-inactive' : ''}${i === 6 ? ' week-divider' : ''}"><input type="text" class="hours-input ${!isActive ? 'inactive' : ''}" data-line="${project.line}" data-active-line="${isActive ? (project.activeLine != null ? project.activeLine : '') : ''}" data-day="${d.date}" data-fulldate="${d.fullDate}" value="${displayValue}" ${disabled} /></td>`;
+              return `<td class="col-day ${isWeekend ? 'col-weekend' : 'col-weekday'} ${!isActive ? 'col-inactive' : ''}${i === 6 ? ' week-divider' : ''}"><div class="cell-wrap${comment ? ' has-comment' : ''}"${comment ? ` title="${escapedComment}"` : ''}><input type="text" class="hours-input ${!isActive ? 'inactive' : ''}" data-line="${project.line}" data-active-line="${isActive ? (project.activeLine != null ? project.activeLine : '') : ''}" data-day="${d.date}" data-fulldate="${d.fullDate}" data-comment="${escapedComment}" value="${displayValue}" ${disabled} /></div></td>`;
             }).join("")}
             <td class="col-total row-total">0</td>
           </tr>
@@ -807,6 +807,45 @@ app.put("/api/hours", (req, res) => {
     const project = activeWeek.projects.find(p => p.line === realLine);
     if (project) {
       project.hours[day] = hours === "" ? null : parseFloat(hours);
+    }
+  }
+
+  res.json({ success: true, pendingCount: pendingChanges.size });
+});
+
+app.put("/api/comment", (req, res) => {
+  const { day, comment, activeLine } = req.body;
+
+  if (activeLine === undefined || activeLine === '' || activeLine === null) {
+    return res.status(400).json({ error: "Cannot edit comments for the previous week" });
+  }
+
+  if (day === undefined) {
+    return res.status(400).json({ error: "Missing required field: day" });
+  }
+
+  const realLine = parseInt(activeLine, 10);
+  const key = `${realLine}-${day}`;
+  const existing = pendingChanges.get(key);
+
+  if (existing) {
+    // Merge comment into existing hours change
+    existing.comment = comment || undefined;
+  } else {
+    // Comment-only change — use current hours from cache
+    const activeWeek = getActiveWeekData();
+    const project = activeWeek && activeWeek.projects ? activeWeek.projects.find(p => p.line === realLine) : null;
+    const currentHours = project && project.hours ? (project.hours[day] || 0) : 0;
+    pendingChanges.set(key, { line: realLine, day, hours: currentHours, comment: comment || undefined });
+  }
+
+  // Update cache optimistically
+  const activeWeek = getActiveWeekData();
+  if (activeWeek) {
+    const project = activeWeek.projects.find(p => p.line === realLine);
+    if (project) {
+      if (!project.comments) project.comments = {};
+      project.comments[day] = comment || null;
     }
   }
 

@@ -162,13 +162,22 @@ class DirectClient {
         fullDate: d.format('YYYY-MM-DD'),
         dayOfWeek: d.format('ddd'),
       })),
-      projects: this.table.map(row => ({
+      projects: this.table.map((row, idx) => ({
         line: row[0],
         code: row[1],
         description: row[2],
         payType: row[3],
         hours: Object.fromEntries(
-          this.dates.map((d, i) => [d.date(), row[i + 4] === '' ? null : row[i + 4]])
+          this.dates.map((d, i) => {
+            const v = row[i + 4];
+            return [d.date(), v === '' ? null : parseFloat(v)];
+          })
+        ),
+        comments: Object.fromEntries(
+          this.dates.map((d, i) => {
+            const c = this.childData.rows[idx] ? (this.childData.rows[idx][CHILD_COMMENT_COL[i + 1]] || '') : '';
+            return [d.date(), c || null];
+          })
         ),
       })),
     };
@@ -236,14 +245,12 @@ class DirectClient {
       const desc = row[CHILD_LINE_DESC] || '';
       const payType = row[16] || '';
       const hours = {};
+      const comments = {};
       for (let d = 1; d <= NUM_DAYS; d++) {
         const val = row[CHILD_DAY_COL[d]];
         const comment = row[CHILD_COMMENT_COL[d]] || '';
-        if (val) {
-          hours[dates[d - 1].date()] = parseFloat(val) + (comment ? '*' : '');
-        } else {
-          hours[dates[d - 1].date()] = null;
-        }
+        hours[dates[d - 1].date()] = val ? parseFloat(val) : null;
+        comments[dates[d - 1].date()] = comment || null;
       }
       projects.push({
         line: i,
@@ -251,6 +258,7 @@ class DirectClient {
         description: desc,
         payType,
         hours,
+        comments,
       });
     }
 
@@ -303,8 +311,8 @@ class DirectClient {
   }
 
   async setm(changes) {
-    for (const { line, day, hours } of changes) {
-      await this.set(line, day, hours);
+    for (const { line, day, hours, comment } of changes) {
+      await this.set(line, day, hours, comment);
     }
   }
 
@@ -747,7 +755,7 @@ class DirectClient {
     } else {
       throw new Error(
         'Multiple charges found for ' + code + '. ' +
-        'Specify a pay type: costpoint add ' + code + ' REG'
+        'Specify a pay type: te add ' + code + ' REG'
       );
     }
 

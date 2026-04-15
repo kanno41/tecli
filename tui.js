@@ -9,19 +9,17 @@ const path = require('path');
 const DirectClient = require('./direct');
 const Costpoint = require('./costpoint');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
+const { getCredentials } = require('./credentials');
 
 require('dotenv').config();
 
-const url = process.env.COSTPOINT_URL;
-const username = process.env.COSTPOINT_USERNAME;
-const password = process.env.COSTPOINT_PASSWORD;
-const system = process.env.COSTPOINT_SYSTEM;
-const useDirect = process.env.COSTPOINT_DIRECT === 'true';
-
-if (!url || !username || !password) {
-  console.error('COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD are required.');
+const creds = getCredentials();
+if (!creds) {
+  console.error('No credentials found. Run `te login` to set up.');
   process.exit(1);
 }
+
+const { url, username, password, system, useDirect } = creds;
 
 // ─── Session management ────────────────────────────────────────
 
@@ -116,6 +114,10 @@ function getActiveWeekData() {
   return activeWeekStart ? cachedWeeks[activeWeekStart] : null;
 }
 
+// Project codes that require a comment when hours are entered
+const COMMENT_REQUIRED_CODES = ['A09909.SUSP.OVH'];
+function isCommentRequired(code) { return COMMENT_REQUIRED_CODES.includes(code); }
+
 // ─── TUI state ─────────────────────────────────────────────────
 
 let data = null;
@@ -196,7 +198,7 @@ async function doSave() {
   try {
     await withClient(async (cp) => {
       if (changes.length === 1) {
-        await cp.set(changes[0].line, changes[0].day, changes[0].hours);
+        await cp.set(changes[0].line, changes[0].day, changes[0].hours, changes[0].comment);
       } else {
         await cp.setm(changes);
       }
@@ -369,7 +371,21 @@ function getCellValue(row, col) {
 
   const hours = project.hours[day];
   if (hours === null || hours === undefined || hours === '') return '';
-  return String(hours).replace(/\*$/, '');
+  return String(hours);
+}
+
+function getCellComment(row, col) {
+  if (!data) return '';
+  const project = data.projects[row];
+  const day = data.dates[col].date;
+  const key = project.line + '-' + day;
+
+  // Check pending comment changes first
+  if (pendingChanges.has(key) && pendingChanges.get(key).comment !== undefined) {
+    return pendingChanges.get(key).comment || '';
+  }
+
+  return (project.comments && project.comments[day]) || '';
 }
 
 function clampCursor() {
@@ -415,7 +431,15 @@ function render() {
 
   if (data && data.dates) {
     const s = data.dates[0], e = data.dates[data.dates.length - 1];
-    lines.push(chalk.dim('Period: ' + s.dayOfWeek + ' ' + s.fullDate + ' \u2014 ' + e.dayOfWeek + ' ' + e.fullDate));
+    let periodLine = chalk.dim('Period: ' + s.dayOfWeek + ' ' + s.fullDate + ' \u2014 ' + e.dayOfWeek + ' ' + e.fullDate);
+    // Show comment for current cell if any
+    if (data.projects && data.projects.length > 0 && !showLeave && mode !== 'prompt') {
+      const curComment = getCellComment(cursorRow, cursorCol);
+      if (curComment) {
+        periodLine += '  ' + chalk.cyan('\u25b8 ' + curComment);
+      }
+    }
+    lines.push(periodLine);
   } else {
     lines.push(chalk.dim('No data loaded.'));
   }
@@ -479,6 +503,7 @@ function render() {
 
       const cells = data.dates.map((d, c) => {
         const val = getCellValue(r, c);
+        const comment = getCellComment(r, c);
         rowTotal += parseFloat(val) || 0;
         const selected = r === cursorRow && c === cursorCol && mode !== 'prompt';
         const modified = pendingChanges.has(p.line + '-' + d.date);
@@ -486,6 +511,10 @@ function render() {
         let txt;
         if (selected && mode === 'edit') {
           txt = lpad(editBuffer + '\u2588', 4);
+        } else if (val && comment) {
+          txt = lpad(val + chalk.cyan('*'), 4);
+        } else if (comment) {
+          txt = lpad(chalk.cyan('*'), 4);
         } else {
           txt = lpad(val || chalk.dim('\u00b7'), 4);
         }
@@ -495,9 +524,10 @@ function render() {
         return txt;
       });
 
+      const codeStr = rpad(trunc(p.code || '', codeW), codeW);
       lines.push(
         lpad(String(r), 2) + '  ' +
-        rpad(trunc(p.code || '', codeW), codeW) + '  ' +
+        (isCommentRequired(p.code) ? chalk.cyan(codeStr) : codeStr) + '  ' +
         rpad(trunc(p.description || '', descW), descW) + '  ' +
         rpad(p.payType || '', 3) + ' ' +
         cells.join(' ') + ' ' +
@@ -537,7 +567,7 @@ function render() {
     if (showLeave) {
       lines.push(chalk.dim('[l]eave back  [r]efresh  [q]uit'));
     } else {
-      lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [c]opy Thu\u2192Fri  [l]eave  [q]uit'));
+      lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [c]opy Thu\u2192Fri  [l]eave  [q]uit'));
     }
   }
   lines.push(statusMsg || chalk.dim('Ready' + (activeClient ? ' \u2022 session active' : '')));
@@ -624,7 +654,17 @@ function handleNavigateKey(str, key) {
         });
         return;
       }
-      if (str === 'c') { doCopyThuFri(); return; }
+      if (str === 'C' || (str === 'c' && key.shift)) {
+        // Edit comment on current cell
+        if (!data || !data.projects || data.projects.length === 0) return;
+        const currentComment = getCellComment(cursorRow, cursorCol);
+        enterPrompt('Comment' + (currentComment ? ' [' + currentComment + ']' : '') + ': ', function(text) {
+          commitComment(text);
+          render();
+        });
+        return;
+      }
+      if (str === 'c' && !key.shift) { doCopyThuFri(); return; }
       if (str === 'l') {
         if (showLeave) { showLeave = false; render(); }
         else { doLeaveBalances(); }
@@ -653,11 +693,35 @@ function handleNavigateKey(str, key) {
 
 function handleEditKey(str, key) {
   switch (key.name) {
-    case 'return':
+    case 'return': {
+      const editedRow = cursorRow;
+      const editedCol = cursorCol;
+      const editedVal = editBuffer;
       commitEdit(editBuffer);
       mode = 'navigate';
       if (data && cursorCol < data.dates.length - 1) cursorCol++;
+      // Auto-prompt for comment on suspense rows
+      if (editedVal !== '' && data && data.projects[editedRow]) {
+        const proj = data.projects[editedRow];
+        if (isCommentRequired(proj.code) && !getCellComment(editedRow, editedCol)) {
+          render();
+          enterPrompt('Comment (required for ' + proj.code + '): ', function(text) {
+            if (text) {
+              // Temporarily set cursor back to apply comment to correct cell
+              const savedRow = cursorRow, savedCol = cursorCol;
+              cursorRow = editedRow;
+              cursorCol = editedCol;
+              commitComment(text);
+              cursorRow = savedRow;
+              cursorCol = savedCol;
+            }
+            render();
+          });
+          return;
+        }
+      }
       break;
+    }
     case 'escape':
       mode = 'navigate';
       editBuffer = '';
@@ -687,6 +751,29 @@ function commitEdit(value) {
     pendingChanges.delete(key);
   } else {
     pendingChanges.set(key, { line: project.line, day, hours });
+  }
+}
+
+function commitComment(text) {
+  if (!data) return;
+  const project = data.projects[cursorRow];
+  const day = data.dates[cursorCol].date;
+  const key = project.line + '-' + day;
+
+  const existing = pendingChanges.get(key);
+  if (existing) {
+    // Merge comment into existing hours change
+    existing.comment = text || undefined;
+  } else {
+    // Comment-only change — use current hours
+    const currentVal = getCellValue(cursorRow, cursorCol);
+    const hours = currentVal === '' ? 0 : parseFloat(currentVal);
+    pendingChanges.set(key, { line: project.line, day, hours, comment: text || undefined });
+  }
+
+  // Update cached data so the indicator shows immediately
+  if (project.comments) {
+    project.comments[day] = text || null;
   }
 }
 

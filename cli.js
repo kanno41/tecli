@@ -9,6 +9,7 @@ const { program } = require("commander");
 const readline = require("readline");
 const ora = require("ora");
 const { normalizeTimesheetStatus } = require("./timesheet-status");
+const { getCredentials, login, logout } = require("./credentials");
 
 require("dotenv").config();
 
@@ -37,31 +38,30 @@ function statusBadge(statusStr) {
 
 // ── Core operation wrappers ──────────────────────────────────────
 
-const url = process.env.COSTPOINT_URL;
-const username = process.env.COSTPOINT_USERNAME;
-const password = process.env.COSTPOINT_PASSWORD;
-const system = process.env.COSTPOINT_SYSTEM;
-const useDirect = process.env.COSTPOINT_DIRECT === "true";
+let _creds = null;
 
-if (!url || !username || !password) {
-  console.error(
-    chalk.red(
-      "Make sure that COSTPOINT_URL, COSTPOINT_USERNAME, COSTPOINT_PASSWORD are set in the environment.",
-    ),
-  );
-  process.exit(1);
-}
-
-if (!useDirect && !system) {
-  console.error(
-    chalk.red(
-      "COSTPOINT_SYSTEM is required when not using direct mode. Set COSTPOINT_DIRECT=true for direct protocol.",
-    ),
-  );
-  process.exit(1);
+function requireCredentials() {
+  if (_creds) return _creds;
+  _creds = getCredentials();
+  if (!_creds) {
+    console.error(
+      chalk.red("No credentials found. Run `te login` to set up."),
+    );
+    process.exit(1);
+  }
+  if (!_creds.useDirect && !_creds.system) {
+    console.error(
+      chalk.red(
+        "COSTPOINT_SYSTEM is required when not using direct mode. Set COSTPOINT_DIRECT=true for direct protocol.",
+      ),
+    );
+    process.exit(1);
+  }
+  return _creds;
 }
 
 function launchClient() {
+  const { url, username, password, system, useDirect } = requireCredentials();
   if (useDirect) return DirectClient.launch(url, username, password);
   return Costpoint.launch(url, username, password, system);
 }
@@ -133,9 +133,9 @@ function showStatus(cp) {
 // ── Commands ─────────────────────────────────────────────────────
 
 program
-  .name("costpoint")
+  .name("te")
   .version(require("./package.json").version)
-  .description("A command line utility for Costpoint.");
+  .description("Time entry CLI for Costpoint.");
 
 program
   .command("show")
@@ -214,7 +214,7 @@ program
       );
       process.exit(1);
     }
-    if (options.comment && !useDirect) {
+    if (options.comment && !requireCredentials().useDirect) {
       console.error(
         chalk.red(
           "  --comment is only supported in direct mode (COSTPOINT_DIRECT=true).",
@@ -372,6 +372,41 @@ program
       console.error(chalk.red(`\n  ${e.message}`));
       process.exit(1);
     }
+  });
+
+program
+  .command("server")
+  .description("start the web UI")
+  .action(() => {
+    require("./server");
+  });
+
+program
+  .command("tui")
+  .description("start the interactive terminal UI")
+  .action(() => {
+    require("./tui");
+  });
+
+program
+  .command("login")
+  .description("store credentials in OS keychain")
+  .action(async () => {
+    try {
+      const creds = await login();
+      console.log(chalk.green(`\n  Credentials saved for ${creds.username}.`));
+    } catch (e) {
+      console.error(chalk.red(`\n  ${e.message}`));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logout")
+  .description("remove stored credentials")
+  .action(() => {
+    logout();
+    console.log(chalk.green("  Credentials removed."));
   });
 
 program.parse(process.argv);

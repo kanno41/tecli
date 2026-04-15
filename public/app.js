@@ -6,8 +6,17 @@
   let data = window.TIMESHEET_DATA;
   let isLoading = window.IS_LOADING;
   let pendingChanges = new Map();
+  let pendingComments = new Map();
   let originalValues = new Map();
+  let originalComments = new Map();
   let statusPollingInterval = null;
+
+  // Project codes that require a comment when hours are entered
+  var COMMENT_REQUIRED_CODES = ["A09909.SUSP.OVH"];
+
+  function isCommentRequired(projectCode) {
+    return COMMENT_REQUIRED_CODES.indexOf(projectCode) !== -1;
+  }
 
   // DOM elements (may not exist if loading)
   const refreshBtn = document.getElementById("refresh-btn");
@@ -40,6 +49,8 @@
         const key = `${project.line}-${d.date}`;
         const value = project.hours[d.date];
         originalValues.set(key, value !== null && value !== undefined ? value : "");
+        const comment = (project.comments && project.comments[d.date]) || "";
+        originalComments.set(key, comment);
       });
     });
   }
@@ -134,6 +145,21 @@
       input.addEventListener("input", handleInputChange);
       input.addEventListener("keydown", handleInputKeydown);
     });
+
+    // Right-click on any cell wrapper to edit comment
+    document.querySelectorAll(".cell-wrap").forEach(wrap => {
+      wrap.addEventListener("contextmenu", handleCommentRightClick);
+    });
+
+    // Mark rows that require comments
+    if (data) {
+      data.projects.forEach(function(project) {
+        if (isCommentRequired(project.code)) {
+          var row = document.querySelector('tr[data-line="' + project.line + '"]');
+          if (row) row.classList.add("comment-required-row");
+        }
+      });
+    }
 
     // Refresh button
     if (refreshBtn) {
@@ -260,6 +286,25 @@
     }
 
     calculateTotals();
+
+    // Auto-prompt for comment on suspense/required-comment rows
+    if (newValue !== "" && data) {
+      var line = parseInt(input.dataset.line);
+      var day = parseInt(input.dataset.day);
+      var activeLine = input.dataset.activeLine;
+      var project = data.projects.find(function(p) { return p.line === line; });
+      if (project && isCommentRequired(project.code)) {
+        // Only prompt if no comment already exists for this cell
+        var key = line + "-" + day;
+        var existingComment = (pendingComments.get(key) || {}).comment || input.dataset.comment || "";
+        if (!existingComment) {
+          // Defer so blur completes first
+          setTimeout(function() {
+            showCommentModal(line, day, activeLine, "", input);
+          }, 50);
+        }
+      }
+    }
   }
 
   function handleInputKeydown(e) {
@@ -284,26 +329,27 @@
   function updateSaveButton() {
     const saveBtn = document.getElementById("save-btn");
     const unsavedIndicator = document.getElementById("unsaved-indicator");
+    const hasChanges = pendingChanges.size > 0 || pendingComments.size > 0;
 
     if (saveBtn) {
-      saveBtn.disabled = pendingChanges.size === 0;
+      saveBtn.disabled = !hasChanges;
     }
     if (unsavedIndicator) {
-      unsavedIndicator.style.display = pendingChanges.size > 0 ? "inline" : "none";
+      unsavedIndicator.style.display = hasChanges ? "inline" : "none";
     }
   }
 
   // Save all pending changes
   async function handleSave() {
     const saveBtn = document.getElementById("save-btn");
-    if (!saveBtn || pendingChanges.size === 0) return;
+    if (!saveBtn || (pendingChanges.size === 0 && pendingComments.size === 0)) return;
 
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     updateSyncStatus("syncing");
 
     try {
-      // Send all pending changes to server
+      // Send all pending hours changes to server
       for (const [key, change] of pendingChanges) {
         const response = await fetch("/api/hours", {
           method: "PUT",
@@ -319,6 +365,24 @@
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           throw new Error(errorData.error || `Failed to update line ${change.line}, day ${change.day}`);
+        }
+      }
+
+      // Send all pending comment changes to server
+      for (const [key, change] of pendingComments) {
+        const response = await fetch("/api/comment", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            day: change.day,
+            comment: change.comment,
+            activeLine: change.activeLine
+          })
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `Failed to update comment`);
         }
       }
 
@@ -349,10 +413,31 @@
         if (input) {
           input.classList.remove("modified");
         }
-        // Update original values
         originalValues.set(key, change.hours === "" ? "" : parseFloat(change.hours));
       });
       pendingChanges.clear();
+
+      // Clear pending comments and update UI
+      pendingComments.forEach((change, key) => {
+        originalComments.set(key, change.comment || "");
+        // Update the cell-wrap indicator
+        var input = document.querySelector('.hours-input[data-line="' + change.line + '"][data-day="' + change.day + '"]');
+        if (input) {
+          input.dataset.comment = change.comment || "";
+          input.classList.remove("comment-modified");
+          var wrap = input.closest(".cell-wrap");
+          if (wrap) {
+            if (change.comment) {
+              wrap.classList.add("has-comment");
+              wrap.title = change.comment;
+            } else {
+              wrap.classList.remove("has-comment");
+              wrap.title = "";
+            }
+          }
+        }
+      });
+      pendingComments.clear();
 
       updateSyncStatus("idle");
       showSuccess("Changes saved successfully!");
@@ -438,6 +523,7 @@
           originalValues.set(key, change.hours === "" ? "" : parseFloat(change.hours));
         });
         pendingChanges.clear();
+        pendingComments.clear();
         updateSyncStatus("idle");
         updateSaveButton();
         overlay.remove();
@@ -450,9 +536,115 @@
     });
   }
 
+  // Comment editing via right-click
+  function handleCommentRightClick(e) {
+    e.preventDefault();
+    var input = e.currentTarget.querySelector(".hours-input");
+    if (!input || input.disabled) return;
+
+    var line = parseInt(input.dataset.line);
+    var day = parseInt(input.dataset.day);
+    var activeLine = input.dataset.activeLine;
+    if (activeLine === undefined || activeLine === "") return;
+
+    var currentComment = input.dataset.comment || "";
+    // Check for pending comment
+    var pendingKey = line + "-" + day;
+    var pending = pendingComments.get(pendingKey);
+    if (pending) currentComment = pending.comment || "";
+
+    showCommentModal(line, day, activeLine, currentComment, input);
+  }
+
+  function showCommentModal(line, day, activeLine, currentComment, inputEl) {
+    // Find project info for display
+    var project = null;
+    var dateInfo = null;
+    if (data) {
+      project = data.projects.find(function(p) { return p.line === line; });
+      dateInfo = data.dates.find(function(d) { return d.date === day; });
+    }
+    var cellRef = (project ? project.code : "Line " + line) +
+      " / " + (dateInfo ? dateInfo.dayOfWeek + " " + dateInfo.fullDate : "Day " + day);
+
+    var existing = document.getElementById("comment-modal");
+    if (existing) existing.remove();
+
+    var overlay = document.createElement("div");
+    overlay.id = "comment-modal";
+    overlay.className = "comment-modal-overlay";
+    overlay.innerHTML =
+      '<div class="comment-modal">' +
+        '<h3>Cell Comment</h3>' +
+        '<p class="comment-cell-ref">' + cellRef + '</p>' +
+        '<textarea id="comment-text" placeholder="Enter comment...">' +
+          (currentComment || "").replace(/</g, "&lt;") +
+        '</textarea>' +
+        '<div class="comment-modal-buttons">' +
+          '<button class="comment-btn-cancel">Cancel</button>' +
+          '<button class="comment-btn-clear">Clear</button>' +
+          '<button class="comment-btn-save">Save</button>' +
+        '</div>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+    var textarea = document.getElementById("comment-text");
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+    function close() { overlay.remove(); }
+
+    function applyComment(text) {
+      var key = line + "-" + day;
+      var orig = originalComments.get(key) || "";
+
+      if (text !== orig) {
+        pendingComments.set(key, { line: line, day: day, comment: text, activeLine: activeLine });
+        inputEl.classList.add("comment-modified");
+      } else {
+        pendingComments.delete(key);
+        inputEl.classList.remove("comment-modified");
+      }
+
+      // Update visual indicator
+      inputEl.dataset.comment = text;
+      var wrap = inputEl.closest(".cell-wrap");
+      if (wrap) {
+        if (text) {
+          wrap.classList.add("has-comment");
+          wrap.title = text;
+        } else {
+          wrap.classList.remove("has-comment");
+          wrap.title = "";
+        }
+      }
+
+      updateSaveButton();
+      close();
+    }
+
+    overlay.querySelector(".comment-btn-cancel").addEventListener("click", close);
+    overlay.querySelector(".comment-btn-clear").addEventListener("click", function() {
+      applyComment("");
+    });
+    overlay.querySelector(".comment-btn-save").addEventListener("click", function() {
+      applyComment(textarea.value);
+    });
+    overlay.addEventListener("click", function(ev) {
+      if (ev.target === overlay) close();
+    });
+    textarea.addEventListener("keydown", function(ev) {
+      if (ev.key === "Escape") close();
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        applyComment(textarea.value);
+      }
+    });
+  }
+
   async function handleRefresh() {
     // Check for unsaved changes
-    if (pendingChanges.size > 0) {
+    if (pendingChanges.size > 0 || pendingComments.size > 0) {
       if (!confirm("You have unsaved changes. Refreshing will discard them. Continue?")) {
         return;
       }
