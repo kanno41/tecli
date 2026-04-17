@@ -390,6 +390,15 @@ async function addProject(code, payType) {
 }
 
 // Sign the timesheet
+//
+// Signing requires a session that has NOT gone through the
+// loadPreviousPeriod init flow — the extra OPEN_RS / getHistoryData calls
+// it performs leave the server-side session in a state where the
+// ACTION_CD='S' transition is silently ignored on save (the request
+// round-trips cleanly but the timesheet stays unsigned). The CLI works
+// because it launches without loadPreviousPeriod. Mirror that here by
+// releasing the persistent client and launching a fresh single-period
+// session just for the sign.
 async function signTimesheet() {
   if (isProcessing) throw new Error("Another operation is in progress");
 
@@ -397,11 +406,17 @@ async function signTimesheet() {
   syncStatus = "syncing";
 
   try {
-    await withClient(async (cp) => {
+    await releaseClient();
+    const cp = useDirect
+      ? await DirectClient.launch(url, username, password)
+      : await Costpoint.launch(url, username, password, system);
+    try {
       await cp.sign();
       storeWeekData(cp.getData());
       saveCache();
-    });
+    } finally {
+      try { await cp.close(); } catch (e) { /* ignore */ }
+    }
 
     lastError = null;
     syncStatus = "idle";
