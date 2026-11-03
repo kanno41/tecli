@@ -973,12 +973,7 @@ class DirectClient {
     if (err) throw new Error('TMMTS_NEW_TS_LINE error: ' + err);
 
     // Update local data with server-populated defaults
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k1Data) {
-      this.childData = k1Data;
-    }
-    const k0Data = protocol.extract204(parsed, 0);
-    if (k0Data) this.parentData = k0Data;
+    this._applyRefresh(parsed);
   }
 
   /**
@@ -1043,10 +1038,7 @@ class DirectClient {
     const err = protocol.checkErrors(parsed);
     if (err) throw new Error('Add to favorites error: ' + err);
 
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k1Data) this.childData = k1Data;
-    const k0Data = protocol.extract204(parsed, 0);
-    if (k0Data) this.parentData = k0Data;
+    this._applyRefresh(parsed);
   }
 
   _buildAddToFavoritesBatch(rowIdx) {
@@ -1140,10 +1132,7 @@ class DirectClient {
     if (hasRescdError && this._isSaveRevisionRequired(parsed)) {
       debug('Revision explanation required — fetching audit details...');
       // Refresh data from this response (server accepted the PUT, just blocked the save)
-      const k0Data = protocol.extract204(parsed, 0);
-      const k1Data = protocol.extract204(parsed, 1);
-      if (k0Data) this.parentData = k0Data;
-      if (k1Data) this.childData = k1Data;
+      this._applyRefresh(parsed);
       this._buildTableRows();
 
       // The server has already blocked the save on this definitive signal —
@@ -1165,17 +1154,14 @@ class DirectClient {
     }
 
     // Refresh data from response
-    const k0Data = protocol.extract204(parsed, 0);
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k0Data) this.parentData = k0Data;
-    if (k1Data) this.childData = k1Data;
+    const childReturned = this._applyRefresh(parsed);
 
     // A save that follows add-to-favorites returns no 204 data. Without a
     // re-fetch the saved line stays a pending row (-59999) in local state,
     // and the next add() reuses it and re-saves it as a duplicate.
     // The save has committed by now, so a failed re-fetch must not read as a
     // failed save
-    if (!k1Data) {
+    if (!childReturned) {
       try {
         await this._refetchTimesheet();
       } catch (e) {
@@ -1202,11 +1188,7 @@ class DirectClient {
     const resp = await this._postServlet(
       protocol.buildRequestBody(this.sid, [...this._get204(0), ...this._get204(1), this._keepalive()])
     );
-    const parsed = protocol.parseResponse(resp);
-    const k0Data = protocol.extract204(parsed, 0);
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k0Data) this.parentData = k0Data;
-    if (k1Data) this.childData = k1Data;
+    this._applyRefresh(protocol.parseResponse(resp));
   }
 
   _isSaveRevisionRequired(parsed) {
@@ -1306,10 +1288,7 @@ class DirectClient {
     }
 
     // Refresh data
-    const k0Data = protocol.extract204(parsed, 0);
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k0Data) this.parentData = k0Data;
-    if (k1Data) this.childData = k1Data;
+    this._applyRefresh(parsed);
     this._buildTableRows();
 
     // Clean up revision state
@@ -1418,15 +1397,9 @@ class DirectClient {
     const lkpOkErr = protocol.checkErrors(lkpOkParsed);
     if (lkpOkErr) throw new Error('Charge lookup OK error: ' + lkpOkErr);
 
-    // Refresh local data from response
-    const k0Data = protocol.extract204(lkpOkParsed, 0);
-    const k1Data = protocol.extract204(lkpOkParsed, 1);
-    if (k0Data) this.parentData = k0Data;
-    if (k1Data) this.childData = k1Data;
-
     // Verify the charge was resolved (K1 should have the new row with charge data)
-    if (k1Data) {
-      const newIdx = k1Data.rowNums.indexOf('-59999');
+    if (this._applyRefresh(lkpOkParsed)) {
+      const newIdx = this.childData.rowNums.indexOf('-59999');
       if (newIdx < 0) {
         debug('WARNING: new row -59999 not found in K1 response');
       }
@@ -1471,10 +1444,7 @@ class DirectClient {
 
     // Refresh local data — the server returns the parent row with
     // ACTION_CD='S' already applied
-    const k0Data = protocol.extract204(parsed, 0);
-    const k1Data = protocol.extract204(parsed, 1);
-    if (k0Data) this.parentData = k0Data;
-    if (k1Data) this.childData = k1Data;
+    this._applyRefresh(parsed);
 
     // Step 2: confirm — browser-exact batch (capture 018): PUT K0 only with
     // editFlag 18 + CMD 206. Deliberately NOT save()/_buildSaveBatch, whose
@@ -1490,10 +1460,7 @@ class DirectClient {
     if (protocol.checkRescds(confirmParsed) || confirmErr) {
       throw new Error('Sign confirm error: ' + (confirmErr || 'server rejected the sign save'));
     }
-    const ck0 = protocol.extract204(confirmParsed, 0);
-    const ck1 = protocol.extract204(confirmParsed, 1);
-    if (ck0) this.parentData = ck0;
-    if (ck1) this.childData = ck1;
+    this._applyRefresh(confirmParsed);
 
     // The active-week sign-confirm save returns no 204 data (unlike normal
     // saves; the previous-week one does), so local state can still show
@@ -1787,13 +1754,13 @@ class DirectClient {
       await this._postServlet(this._buildCorrectEvent()),
       'Correct timesheet'
     );
-    this._refreshFrom(eventParsed);
+    this._applyRefresh(eventParsed);
 
     const saveParsed = this._parseActionResponse(
       await this._postServlet(this._buildCorrectSaveBatch()),
       'Correct timesheet save'
     );
-    this._refreshFrom(saveParsed);
+    this._applyRefresh(saveParsed);
 
     // A live correction once committed while its save response still showed
     // the week closed, so confirm with a fresh fetch before failing
@@ -1823,11 +1790,14 @@ class DirectClient {
     return parsed;
   }
 
-  _refreshFrom(parsed) {
+  // Takes the parent (K0) and child (K1) rows a 204 refresh carries, keeping
+  // the current ones for a key that came back empty. Returns whether K1 came back.
+  _applyRefresh(parsed) {
     const k0Data = protocol.extract204(parsed, 0);
     const k1Data = protocol.extract204(parsed, 1);
     if (k0Data) this.parentData = k0Data;
     if (k1Data) this.childData = k1Data;
+    return Boolean(k1Data);
   }
 
   /**
