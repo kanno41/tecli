@@ -12,4 +12,8 @@ function parseHours(value) {
   return Number.isFinite(n) && n >= 0 && n <= MAX_HOURS ? n : null;
 }
 
-module.exports = { MAX_HOURS, parseHours };
+// Day column of the te show table: xx.xx plus the comment marker, and
+// cli-table's one-space padding each side (counted inside the width)
+const DAY_COLUMN_WIDTH = '12.75*'.length + 2;
+
+module.exports = { MAX_HOURS, DAY_COLUMN_WIDTH, parseHours };

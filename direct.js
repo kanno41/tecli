@@ -11,6 +11,7 @@ const moment = require('moment');
 const Table = require('cli-table');
 const protocol = require('./protocol');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
+const { DAY_COLUMN_WIDTH } = require('./hours');
 
 const debug = process.env.DEBUG ? (...args) => console.error(...args) : () => {};
 
@@ -2636,7 +2637,7 @@ class DirectClient {
     codeW += 2; // padding
     this.table = new Table({
       head: ['Line', 'Code', 'Description', 'Pay', ...this.dates.map(d => d.format('D'))],
-      colWidths: [6, codeW, 20, 5, ...this.dates.slice().fill(5)],
+      colWidths: [6, codeW, 20, 5, ...this.dates.slice().fill(DAY_COLUMN_WIDTH)],
       colAligns: ['middle', 'left', 'left', 'left', ...this.dates.slice().fill('middle')],
     });
   }

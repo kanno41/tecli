@@ -4,6 +4,7 @@ const moment = require('moment');
 const puppeteer = require('puppeteer');
 const Table = require('cli-table');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
+const { DAY_COLUMN_WIDTH } = require('./hours');
 const protocol = require('./protocol');
 const { RevisionRequiredError } = require('./direct');
 
@@ -348,7 +349,7 @@ class Costpoint {
 
     this.table = new Table({
       head: ['Line', 'Description', ...this.dates.map(d => d.format('D'))],
-      colWidths: [6, 26, ...this.dates.slice().fill(5)],
+      colWidths: [6, 26, ...this.dates.slice().fill(DAY_COLUMN_WIDTH)],
       colAligns: ['middle', 'left', ...this.dates.slice().fill('middle')],
     });
 
