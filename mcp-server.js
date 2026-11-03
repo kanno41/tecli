@@ -9,13 +9,13 @@ const { getCredentials, assertMockSafe, isMockRun } = require('./credentials');
 const { COMMON_CODES, resolveAlias } = require('./charge-codes');
 const { normalizeWorkLocation } = require('./add-options');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
-const { launchForPeriod, createSessionManager, listFavorites } = require('./session');
+const { launchForPeriod, createSessionManager, createRevisionHold, listFavorites } = require('./session');
 const { weekLabel, weekSummary } = require('./week-label');
 const { MAX_HOURS } = require('./hours');
 
 require('dotenv').config();
 
-const { RevisionRequiredError, SaveOutcomeUnknownError } = DirectClient;
+const { SaveOutcomeUnknownError } = DirectClient;
 
 const backSchema = z
   .number()
@@ -112,7 +112,8 @@ const NOTE = {
  * { server, shutdown }; shutdown closes the held Costpoint session.
  */
 function buildServer(options = {}) {
-  let pendingRevisionBack = null;
+  // Edits waiting for a revision explanation live only on the current session
+  const revisionHold = createRevisionHold();
 
   function credentials() {
     const creds = options.creds || getCredentials();
@@ -129,9 +130,7 @@ function buildServer(options = {}) {
   const manager = createSessionManager({
     launch: period => launchForPeriod(credentials(), period),
     idleMs: options.idleMs,
-    onRelease: () => {
-      pendingRevisionBack = null;
-    },
+    onRelease: () => revisionHold.clear(),
   });
   const { withClient, releaseClient } = manager;
 
@@ -145,12 +144,11 @@ function buildServer(options = {}) {
     }
   }
 
-  // Edits waiting for a revision explanation live only on the current session
   function guardRevision(back) {
-    if (pendingRevisionBack === null) return;
-    if (back !== pendingRevisionBack) {
+    if (!revisionHold.held) return;
+    if (back !== revisionHold.period) {
       throw new Error(
-        `Week back=${pendingRevisionBack} has edits waiting for a revision explanation. Call save_with_explanation first; using another week now would discard them.`
+        `Week back=${revisionHold.period} has edits waiting for a revision explanation. Call save_with_explanation first; using another week now would discard them.`
       );
     }
   }
@@ -170,10 +168,7 @@ function buildServer(options = {}) {
         const data = cp.getData();
         return text(`${done}. Saved.\n\n${formatTimesheet(data, back)}${signHint(data, back)}`);
       } catch (e) {
-        if (e instanceof RevisionRequiredError) {
-          pendingRevisionBack = back;
-          return revisionResult(e, summary);
-        }
+        if (revisionHold.hold(e, back)) return revisionResult(e, summary);
         await releaseClient();
         if (e instanceof SaveOutcomeUnknownError) return confirmSave(back, done, intended, e);
         throw e;
@@ -363,9 +358,9 @@ function buildServer(options = {}) {
     `Sign a timesheet (current week by default). This submits it for approval. Runs on its own fresh login, never on the session used for edits. ${NOTE.error}`,
     { back: backSchema },
     async ({ back = 0 }) => {
-      if (pendingRevisionBack !== null) {
+      if (revisionHold.held) {
         throw new Error(
-          `Week back=${pendingRevisionBack} has edits waiting for a revision explanation. Call save_with_explanation first; signing now would discard them.`
+          `Week back=${revisionHold.period} has edits waiting for a revision explanation. Call save_with_explanation first; signing now would discard them.`
         );
       }
       await releaseClient();
@@ -386,21 +381,23 @@ function buildServer(options = {}) {
       explanation: z.string().describe('Explanation for the timesheet revision'),
     },
     async ({ explanation }) => {
-      if (pendingRevisionBack === null || !manager.current()) {
+      if (!revisionHold.held || !manager.current()) {
         throw new Error(
           'No revision explanation is pending. The session that held the edits was released, so redo the edit and save again.'
         );
       }
-      const back = pendingRevisionBack;
+      const back = revisionHold.period;
       const cp = await manager.getClient(back);
-      try {
-        await cp.saveWithExplanation(explanation);
-      } catch (e) {
-        // Like editWeek: a failed save must not leave its edits for the next call
-        await releaseClient();
-        throw e;
-      }
-      pendingRevisionBack = null;
+      await revisionHold.finish(async () => {
+        try {
+          await cp.saveWithExplanation(explanation);
+        } catch (e) {
+          // Like editWeek: a failed save must not leave its edits for the next
+          // call. Releasing the session also drops the hold.
+          await releaseClient();
+          throw e;
+        }
+      });
       const data = cp.getData();
       return text(`Saved with explanation.\n\n${formatTimesheet(data, back)}${signHint(data, back)}`);
     }
