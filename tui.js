@@ -14,7 +14,7 @@ const { normalizeWorkLocation } = require('./add-options');
 const numberPick = require('./number-pick');
 const { writePrivateFile } = require('./private-file');
 const { periodLabel, stepPeriod, currentWeekStart } = require('./tui-nav');
-const { launchForPeriod, createSessionManager, listFavorites } = require('./session');
+const { launchForPeriod, createSessionManager, createRevisionHold, listFavorites } = require('./session');
 
 require('dotenv').config();
 
@@ -223,6 +223,10 @@ async function fetchData() {
   }
 }
 
+// The week whose save waits on a revision explanation. Only the explanation
+// prompt reads it; Esc leaves it set and the next save that asks replaces it.
+const revisionHold = createRevisionHold();
+
 async function doSave() {
   if (isProcessing || pendingChanges.size === 0) {
     setStatus('Nothing to save.', 2000);
@@ -248,7 +252,7 @@ async function doSave() {
     clampCursor();
     savedStatus('Saved ' + changes.length + ' change' + (changes.length !== 1 ? 's' : '') + '.');
   } catch (e) {
-    if (e.name === 'RevisionRequiredError') {
+    if (revisionHold.hold(e, period)) {
       stopSpinner();
       isProcessing = false;
       const details = e.auditDetails
@@ -259,6 +263,7 @@ async function doSave() {
       render();
       enterPrompt('Explanation: ', async explanation => {
         if (!explanation || !explanation.trim()) {
+          revisionHold.clear();
           setStatus(chalk.red('Save cancelled — explanation required.'), 3000);
           render();
           return;
@@ -268,11 +273,13 @@ async function doSave() {
         setStatus('Saving with explanation...');
         render();
         try {
-          await withClient(async cp => {
-            await cp.saveWithExplanation(explanation.trim());
-            storeClientData(cp);
-            saveCache();
-          }, period);
+          await revisionHold.finish(held =>
+            withClient(async cp => {
+              await cp.saveWithExplanation(explanation.trim());
+              storeClientData(cp);
+              saveCache();
+            }, held)
+          );
           loadViewData();
           pendingChanges.clear();
           clampCursor();
