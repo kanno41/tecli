@@ -13,7 +13,7 @@ const { MAX_HOURS, parseHours } = require('./hours');
 const { writePrivateFile } = require('./private-file');
 const { getCredentials } = require('./credentials');
 const weekWindow = require('./week-window');
-const { launchForPeriod, createSessionManager, listFavorites } = require('./session');
+const { launchForPeriod, createSessionManager, createRevisionHold, listFavorites } = require('./session');
 const { createWebGuard, HOST } = require('./web-guard');
 const { escapeHtml: esc } = require('./public/render');
 
@@ -64,7 +64,7 @@ let cachedWeeks = {}; // { "2026-04-06": weekData, ... }
 let activeWeekStart = null; // fullDate of the most recently fetched week
 let cachedPeriodCount = 0; // periods the session can reach (0 = unknown)
 let pendingChanges = new Map(); // key: "period-line-day", value: { period, line, day, hours, comment }
-let pendingRevisionWeek = null; // period whose save is waiting on a revision explanation (null = none)
+const revisionHold = createRevisionHold(); // the period whose save is waiting on an explanation
 let isProcessing = false;
 let lastError = null;
 let syncStatus = 'idle'; // idle, loading, syncing, error
@@ -198,8 +198,7 @@ async function saveAllChanges() {
           saveCache();
         }, period);
       } catch (e) {
-        if (e.name === 'RevisionRequiredError') {
-          pendingRevisionWeek = period;
+        if (revisionHold.hold(e, period)) {
           syncStatus = 'idle';
           return { revisionRequired: true, period, auditDetails: e.auditDetails, saved };
         }
@@ -232,22 +231,22 @@ function clearPendingPeriod(period) {
 
 async function saveWithExplanation(explanation) {
   if (isProcessing) throw new Error('Another operation is in progress');
-  if (pendingRevisionWeek === null) throw new Error('No save is waiting on a revision explanation');
+  revisionHold.assertHeld();
 
   isProcessing = true;
   syncStatus = 'syncing';
-  const period = pendingRevisionWeek;
+  const period = revisionHold.period;
 
   try {
     // Same period as the save that asked for it, so this reuses that session
-    await withClient(async cp => {
-      await cp.saveWithExplanation(explanation);
-      storeClientData(cp, period);
-      saveCache();
-    }, period);
-
-    clearPendingPeriod(period);
-    pendingRevisionWeek = null;
+    await revisionHold.finish(async () => {
+      await withClient(async cp => {
+        await cp.saveWithExplanation(explanation);
+        storeClientData(cp, period);
+        saveCache();
+      }, period);
+      clearPendingPeriod(period);
+    });
     lastError = null;
     syncStatus = 'idle';
   } catch (e) {
@@ -303,8 +302,7 @@ async function addProject(code, payType, period, favorite = false, workLocation)
     syncStatus = 'idle';
     return { success: true, warning };
   } catch (e) {
-    if (e.name === 'RevisionRequiredError') {
-      pendingRevisionWeek = period;
+    if (revisionHold.hold(e, period)) {
       syncStatus = 'idle';
       return { revisionRequired: true, period, auditDetails: e.auditDetails };
     }
@@ -369,7 +367,7 @@ async function fetchFreshData() {
   try {
     // Release existing session — we want fresh data from server
     await releaseClient();
-    pendingRevisionWeek = null;
+    revisionHold.clear();
 
     const cp = await getClient();
 
