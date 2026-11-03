@@ -4,7 +4,6 @@
 const chalk = require('chalk');
 const Table = require('cli-table');
 const Costpoint = require('./costpoint');
-const DirectClient = require('./direct');
 const { program, InvalidArgumentError } = require('commander');
 const readline = require('readline');
 const ora = require('ora');
@@ -12,7 +11,8 @@ const { normalizeTimesheetStatus } = require('./timesheet-status');
 const { getCredentials, login, logout } = require('./credentials');
 const { COMMON_CODES, resolveAlias } = require('./charge-codes');
 const { normalizeWorkLocation } = require('./add-options');
-const { weekLabel, assertBackReachable, weekSummary } = require('./week-label');
+const { weekLabel, weekSummary } = require('./week-label');
+const { launchForPeriod } = require('./session');
 
 require('dotenv').config();
 
@@ -64,12 +64,6 @@ function requireDirect(feature) {
   if (!requireCredentials().useDirect) throw new Costpoint.NotSupportedError(feature);
 }
 
-function launchClient() {
-  const { url, username, password, useDirect } = requireCredentials();
-  if (useDirect) return DirectClient.launch(url, username, password);
-  return Costpoint.launch(url, username, password);
-}
-
 function parseBack(value) {
   if (!/^\d+$/.test(value) || Number(value) < 1) {
     throw new InvalidArgumentError('must be an integer >= 1.');
@@ -99,27 +93,17 @@ async function connect(options = {}) {
   if (back && !requireCredentials().useDirect) {
     throw new Error('--prev and --back are only supported in direct mode (COSTPOINT_DIRECT=true).');
   }
-  const s = spin('Authenticating...');
+  const week = back ? weekLabel(back) : null;
+  const s = spin(week ? `Authenticating and loading ${week}...` : 'Authenticating...');
   let cp;
   try {
-    cp = await launchClient();
-    s.succeed('Authenticated');
+    cp = await launchForPeriod(requireCredentials(), back);
   } catch (e) {
-    s.fail('Authentication failed');
+    s.fail(week ? `Could not load ${week}` : 'Authentication failed');
     throw e;
   }
-  if (back) {
-    const p = spin(`Loading ${weekLabel(back)}...`);
-    try {
-      assertBackReachable(back, cp.getPeriods().length);
-      await cp.selectPeriod(back);
-      p.succeed(`${weekLabel(back)[0].toUpperCase()}${weekLabel(back).slice(1)} loaded`);
-    } catch (e) {
-      p.fail(`Could not load ${weekLabel(back)}`);
-      await cp.close().catch(() => {});
-      throw e;
-    }
-  }
+  s.succeed('Authenticated');
+  if (week) spin(`Loading ${week}...`).succeed(`${week[0].toUpperCase()}${week.slice(1)} loaded`);
   return cp;
 }
 

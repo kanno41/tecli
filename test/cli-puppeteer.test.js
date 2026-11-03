@@ -44,3 +44,10 @@ for (const [args, feature] of [
     assert.doesNotMatch(out, /Authenticat/);
   });
 }
+
+test('te show --prev refuses Puppeteer mode before logging in', async () => {
+  const { code, out } = await run('show', '--prev');
+  assert.equal(code, 1);
+  assert.match(out, /--prev and --back are only supported in direct mode \(COSTPOINT_DIRECT=true\)\./);
+  assert.doesNotMatch(out, /Authenticat/);
+});
