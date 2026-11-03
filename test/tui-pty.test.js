@@ -240,5 +240,35 @@ describe('tui against the mock', { skip: !hasScript() && 'needs util-linux scrip
       assert.equal(mock.db.period(0).status, 'O');
       assert.equal(await t.quit(), 0);
     });
+
+    // tecli-od6 step 3: what drops or keeps a save waiting on an explanation
+    test('an empty explanation cancels the save and keeps the edit', async () => {
+      const original = structuredClone(mock.db.period(1).lines);
+      const t = await startTui();
+      await t.press('<', /PREVIOUS WEEK[\s\S]*\[Processed\]/);
+      await t.press('4\r', /1 unsaved/);
+      await t.press('s', /Revision required: [\s\S]*Explanation: /);
+      await t.press('\r', /Save cancelled — explanation required\.[\s\S]*1 unsaved/);
+      assert.deepEqual(mock.db.period(1).lines, original);
+      await t.press('s', /Explanation: /);
+      await t.press('second look\r', /Saved with revision explanation\./);
+      assert.notDeepEqual(mock.db.period(1).lines, original);
+      assert.equal(await t.quit(), 0);
+    });
+
+    test('a failed explanation save keeps the edit for another try', async () => {
+      const original = structuredClone(mock.db.period(1).lines);
+      const t = await startTui();
+      await t.press('<', /PREVIOUS WEEK[\s\S]*\[Processed\]/);
+      await t.press('4\r', /1 unsaved/);
+      await t.press('s', /Explanation: /);
+      mock.failSave(1, 'Explanation rejected');
+      await t.press('first try\r', /Save failed: Save with explanation error: Explanation rejected[\s\S]*1 unsaved/);
+      assert.deepEqual(mock.db.period(1).lines, original);
+      // The mock keeps the explanation on the session, so the retry saves plainly
+      await t.press('s', /Saved 1 change\./);
+      assert.notDeepEqual(mock.db.period(1).lines, original);
+      assert.equal(await t.quit(), 0);
+    });
   });
 });

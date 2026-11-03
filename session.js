@@ -140,4 +140,41 @@ function createSessionManager({ launch, idleMs = DEFAULT_IDLE_MS, onLaunch, onLa
   };
 }
 
-module.exports = { launchForPeriod, listFavorites, isSessionError, createSessionManager };
+// A save that needs a revision explanation (RevisionRequiredError) leaves its
+// edits on the session for that period. The hold remembers the period until
+// finish() saves them with the explanation or the caller drops them (clear()).
+function createRevisionHold() {
+  let heldPeriod = null;
+
+  function assertHeld() {
+    if (heldPeriod === null) throw new Error('No save is waiting on a revision explanation');
+  }
+
+  return {
+    get held() {
+      return heldPeriod !== null;
+    },
+    get period() {
+      return heldPeriod;
+    },
+    // True when e asks for an explanation; the caller reports it instead of throwing
+    hold(e, period) {
+      if (!e || e.name !== 'RevisionRequiredError') return false;
+      heldPeriod = period;
+      return true;
+    },
+    clear() {
+      heldPeriod = null;
+    },
+    assertHeld,
+    // save(period) sends the explanation. A failed save keeps the hold.
+    async finish(save) {
+      assertHeld();
+      const result = await save(heldPeriod);
+      heldPeriod = null;
+      return result;
+    },
+  };
+}
+
+module.exports = { launchForPeriod, listFavorites, isSessionError, createSessionManager, createRevisionHold };
