@@ -31,12 +31,21 @@ describe('cli --back option', () => {
     assert.equal(weekLabel(4), '4 weeks back');
   });
 
-  test('show, set, setm, sign, add and favorites all take --back and --prev', () => {
-    for (const name of ['show', 'set', 'setm', 'sign', 'add', 'favorites']) {
+  test('show, set, setm, sign and add all take --back and --prev', () => {
+    for (const name of ['show', 'set', 'setm', 'sign', 'add']) {
       const cmd = program.commands.find(c => c.name() === name);
       const flags = cmd.options.map(o => o.long);
       assert.ok(flags.includes('--back'), `${name} --back`);
       assert.ok(flags.includes('--prev'), `${name} --prev`);
     }
+  });
+
+  // Favorites belong to the user, not a week (tecli-1y5)
+  test('favorites takes no --back or --prev', () => {
+    const cmd = program.commands.find(c => c.name() === 'favorites');
+    const flags = cmd.options.map(o => o.long);
+    assert.ok(!flags.includes('--back'), 'favorites --back');
+    assert.ok(!flags.includes('--prev'), 'favorites --prev');
+    assert.doesNotMatch(cmd.helpInformation(), /--back|--prev/);
   });
 });

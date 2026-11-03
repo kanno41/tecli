@@ -479,32 +479,34 @@ async function pickFromFavorites(cp) {
   return favs[n - 1];
 }
 
-withWeekOptions(
-  program.command('favorites').alias('fav').description('list favorite charge codes saved in Costpoint'),
-  'list favorites for'
-).action(async options => {
-  try {
-    requireDirect('Favorites');
-    const cp = await connect(options);
-    const favs = await withSpinner('Loading favorites', 'Favorites loaded', () => cp.getFavorites());
-    console.log();
+// Favorites belong to the user, not a week, so there is no week option
+program
+  .command('favorites')
+  .alias('fav')
+  .description('list favorite charge codes saved in Costpoint')
+  .action(async () => {
+    try {
+      requireDirect('Favorites');
+      const cp = await connect();
+      const favs = await withSpinner('Loading favorites', 'Favorites loaded', () => cp.getFavorites());
+      console.log();
 
-    if (favs.length === 0) {
-      console.log(chalk.dim('  No favorites found. Add them in the Costpoint web UI.'));
-    } else {
-      const t = new Table({
-        head: [chalk.cyan('#'), chalk.cyan('Code'), chalk.cyan('Description'), chalk.cyan('Pay Type')],
-      });
-      favs.forEach((f, i) => t.push([i, f.code, f.description || '', f.payType || '']));
-      console.log(t.toString());
+      if (favs.length === 0) {
+        console.log(chalk.dim('  No favorites found. Add them in the Costpoint web UI.'));
+      } else {
+        const t = new Table({
+          head: [chalk.cyan('#'), chalk.cyan('Code'), chalk.cyan('Description'), chalk.cyan('Pay Type')],
+        });
+        favs.forEach((f, i) => t.push([i, f.code, f.description || '', f.payType || '']));
+        console.log(t.toString());
+      }
+      console.log();
+      await cp.close();
+    } catch (e) {
+      console.error(chalk.red(`\n  ${e.message}`));
+      process.exit(1);
     }
-    console.log();
-    await cp.close();
-  } catch (e) {
-    console.error(chalk.red(`\n  ${e.message}`));
-    process.exit(1);
-  }
-});
+  });
 
 program
   .command('leave')
