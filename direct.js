@@ -2444,11 +2444,12 @@ class DirectClient {
   }
 
   /**
-   * Parse ANY HTML form — extracts action URL and all hidden input fields.
-   * Used for gateway replay forms that contain the original POST data.
+   * Parse an HTML auto-submit form: the action URL and every input that has
+   * both a name and a value (in either order). skipSubmit leaves submit
+   * buttons out, as gateway replay forms need.
    * Returns { action, body } or null.
    */
-  _parseAnyForm(html) {
+  _parseForm(html, { skipSubmit = false } = {}) {
     const actionMatch = html.match(/<form[^>]+action="([^"]+)"/i);
     if (!actionMatch) return null;
     const action = this._decodeHtmlEntities(actionMatch[1]);
@@ -2458,8 +2459,7 @@ class DirectClient {
     let m;
     while ((m = inputRe.exec(html)) !== null) {
       const tag = m[0];
-      // Skip submit buttons
-      if (/type="submit"/i.test(tag)) continue;
+      if (skipSubmit && /type="submit"/i.test(tag)) continue;
       const nameMatch = tag.match(/name="([^"]+)"/i);
       const valueMatch = tag.match(/value="([^"]*)"/i);
       if (nameMatch && valueMatch) {
@@ -2480,30 +2480,8 @@ class DirectClient {
    * Returns { action, body } or null.
    */
   _parseSAMLForm(html) {
-    // Must contain a SAMLResponse input to be a SAML form
     if (!/<input[^>]+name="SAMLResponse"/i.test(html)) return null;
-
-    const actionMatch = html.match(/<form[^>]+action="([^"]+)"/i);
-    if (!actionMatch) return null;
-    const action = this._decodeHtmlEntities(actionMatch[1]);
-
-    // Extract all hidden input fields — handle name/value in either order
-    const params = [];
-    const inputRe = /<input[^>]*>/gi;
-    let m;
-    while ((m = inputRe.exec(html)) !== null) {
-      const tag = m[0];
-      const nameMatch = tag.match(/name="([^"]+)"/i);
-      const valueMatch = tag.match(/value="([^"]*)"/i);
-      if (nameMatch && valueMatch) {
-        const name = this._decodeHtmlEntities(nameMatch[1]);
-        const value = this._decodeHtmlEntities(valueMatch[1]);
-        params.push(encodeURIComponent(name) + '=' + encodeURIComponent(value));
-      }
-    }
-    if (params.length === 0) return null;
-
-    return { action, body: params.join('&') };
+    return this._parseForm(html);
   }
 
   // =========================================================================
