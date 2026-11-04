@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const { stripVTControlCharacters: stripAnsi } = require('util');
 const { startMock } = require('./mock-helper');
+const codec = require('../mock/codec');
 
 const TUI = path.join(__dirname, '..', 'tui.js');
 const STEP_MS = 15000;
@@ -51,7 +52,7 @@ describe('tui against the mock', { skip: !hasScript() && 'needs util-linux scrip
   });
 
   // Starts the TUI and resolves once the first fetch has loaded
-  async function startTui() {
+  async function startTui(env = {}) {
     const command = `stty rows 50 cols 120; exec '${process.execPath}' '${TUI}'`;
     const child = spawn('script', ['-qec', command, '/dev/null'], {
       cwd: home,
@@ -65,6 +66,7 @@ describe('tui against the mock', { skip: !hasScript() && 'needs util-linux scrip
         COSTPOINT_USERNAME: 'mock',
         COSTPOINT_PASSWORD: 'mock',
         COSTPOINT_DIRECT: 'true',
+        ...env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -174,6 +176,28 @@ describe('tui against the mock', { skip: !hasScript() && 'needs util-linux scrip
       assert.ok(added);
       assert.equal(added[16], thirteenth.payType);
       assert.equal(await t.quit(), 0);
+    });
+
+    // The pick takes the te add / add_from_favorites path (tecli-a1t.12): the
+    // favorites lookup runs again on the session that adds and saves the line
+    test('a pick looks the favorite up on the session that saves it', async () => {
+      const traceFile = path.join(home, 'trace.jsonl');
+      const t = await startTui({ COSTPOINT_TRACE: traceFile });
+      await t.press('f', /Favorites loaded\./);
+      await t.press('3', /Added PROJ\.C\.300\./);
+      assert.equal(await t.quit(), 0);
+      const requests = fs
+        .readFileSync(traceFile, 'utf8')
+        .trim()
+        .split('\n')
+        .map(l => JSON.parse(l).request)
+        .filter(body => new URLSearchParams(body).has('cmd'))
+        .map(body => codec.parseRequest(body));
+      const saves = requests.filter(r => r.commands.some(c => c.reqCd === 206));
+      assert.equal(saves.length, 1);
+      const favoritesQuery = c => c.codes.R === 'HLKP' && (c.codes.W || '').includes('$H_LKP_SEL_LVL$^1^2^');
+      const onSaveSession = requests.filter(r => r.sid === saves[0].sid);
+      assert.ok(onSaveSession.some(r => r.commands.some(favoritesQuery)));
     });
 
     test('[e] asks pay type and work location for the next pick', async () => {

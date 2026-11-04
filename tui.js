@@ -332,7 +332,17 @@ async function doSign() {
   }
 }
 
-async function doAddProject(code, payType, favorite = false, workLocation) {
+function doAddProject(code, payType, favorite = false, workLocation) {
+  return runAdd(code, cp => cp.add(code, payType || 'REG', { workLocation }), favorite);
+}
+
+// A pick from [f]: the favorite is looked up again on the session that adds
+// it, like te add and add_from_favorites (tecli-a1t.12)
+function doAddFavorite(index, fav, { payType, workLocation } = {}) {
+  return runAdd(fav.code, cp => cp.addFromFavorite(index, { payType, workLocation }));
+}
+
+async function runAdd(code, add, favorite = false) {
   if (isProcessing) return;
   isProcessing = true;
   startSpinner();
@@ -342,7 +352,7 @@ async function doAddProject(code, payType, favorite = false, workLocation) {
   try {
     let favoriteError = null;
     await withClient(async cp => {
-      await cp.add(code, payType || 'REG', { workLocation });
+      await add(cp);
       if (favorite) {
         try {
           await cp.addToFavorites();
@@ -845,14 +855,14 @@ function handleNavigateKey(str, key) {
         const fav = favoritesData[n - 1];
         if (favoriteOverride) {
           favoriteOverride = false;
-          enterPrompt('Pay type [' + (fav.payType || 'REG') + ']: ', function (pt) {
+          enterPrompt('Pay type [' + (fav.payType || 'Costpoint default') + ']: ', function (pt) {
             promptWorkLocation(function (loc) {
-              doAddProject(fav.code, pt.trim().toUpperCase() || fav.payType || 'REG', false, loc);
+              doAddFavorite(n - 1, fav, { payType: pt.trim().toUpperCase(), workLocation: loc });
             });
           });
           return;
         }
-        doAddProject(fav.code, fav.payType || 'REG');
+        doAddFavorite(n - 1, fav);
       })
     )
       return;

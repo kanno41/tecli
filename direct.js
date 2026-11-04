@@ -774,17 +774,18 @@ class DirectClient {
   }
 
   /**
-   * Add a project by index into the favorites list. Convenience wrapper:
-   * fetches favorites, picks by index, delegates to add().
+   * Add a project by index into the favorites list, looked up on this session
+   * (the TUI, MCP and te add path). A blank favorite pay type goes to add() as
+   * undefined, so Costpoint resolves the charge; payType overrides it.
    */
-  async addFromFavorite(index) {
+  async addFromFavorite(index, { payType, workLocation } = {}) {
     const favs = await this.getFavorites({ keepLine: true });
     if (!favs.length) throw new Error('No favorites available');
     if (index < 0 || index >= favs.length) {
       throw new Error('Favorite index ' + index + ' out of range (0-' + (favs.length - 1) + ')');
     }
     const fav = favs[index];
-    await this.add(fav.code, fav.payType || undefined);
+    await this.add(fav.code, payType || fav.payType || undefined, { workLocation });
     return fav;
   }
 

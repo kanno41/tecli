@@ -342,12 +342,7 @@ function buildServer(options = {}) {
     async ({ index, workLocation, back = 0 }) => {
       const zip = normalizeWorkLocation(workLocation);
       return editWeek(back, 'Favorite added', async cp => {
-        const favs = await cp.getFavorites({ keepLine: true });
-        if (index >= favs.length) {
-          throw new Error(`Favorite index ${index} out of range (0-${favs.length - 1})`);
-        }
-        const fav = favs[index];
-        await cp.add(fav.code, fav.payType || undefined, { workLocation: zip });
+        const fav = await cp.addFromFavorite(index, { workLocation: zip });
         return `Added ${fav.payType ? `${fav.code} (${fav.payType})` : fav.code}`;
       });
     }

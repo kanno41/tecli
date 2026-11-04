@@ -136,6 +136,23 @@ describe('mock favorites', () => {
     assert.equal(cp.pendingLine().payType, 'REG');
   });
 
+  // H01980.A.N102.210 is stored with no pay type (tecli-a1t.12)
+  test('a favorite with no pay type is added without one, unless overridden', async () => {
+    mock.db.favorites.push({ code: 'PROJ.C.300', payType: '', desc: 'Gamma Overhead' });
+    const cp = await mock.launch();
+    const calls = [];
+    const add = cp.add.bind(cp);
+    cp.add = (...args) => {
+      calls.push(args);
+      return add(...args);
+    };
+    await cp.addFromFavorite(2, { workLocation: '20190' });
+    assert.deepEqual(calls[0], ['PROJ.C.300', undefined, { workLocation: '20190' }]);
+    await cp.save();
+    await cp.addFromFavorite(2, { payType: 'REG' });
+    assert.deepEqual(calls[1], ['PROJ.C.300', 'REG', { workLocation: undefined }]);
+  });
+
   test('a favorite index out of range is an error', async () => {
     const cp = await mock.launch();
     await assert.rejects(() => cp.addFromFavorite(9), /out of range/);
