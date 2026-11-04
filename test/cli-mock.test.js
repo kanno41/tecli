@@ -30,7 +30,7 @@ describe('te against the mock', () => {
   let home;
 
   before(async () => {
-    mock = await startMock();
+    mock = await startMock({ password: 'mock' });
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'tecli-cli-'));
   });
 
@@ -54,16 +54,17 @@ describe('te against the mock', () => {
 
   // Async so the in-process mock keeps serving while the CLI runs. stdin is
   // not a TTY here, so add asks nothing.
-  const te = (...args) =>
+  const teWith = (envOverrides, ...args) =>
     new Promise(resolve => {
       const child = execFile(
         process.execPath,
         [CLI, ...args],
-        { cwd: home, env: env(), timeout: 20000 },
+        { cwd: home, env: { ...env(), ...envOverrides }, timeout: 20000 },
         (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: stripAnsi(stdout + stderr) })
       );
       child.stdin.end();
     });
+  const te = (...args) => teWith({}, ...args);
 
   // Runs te on a pty and types each answer once its prompt shows up
   const teOnTTY = (args, answers) =>
@@ -131,6 +132,15 @@ describe('te against the mock', () => {
       const { code, out } = await te('show', '--back', String(reach + 1));
       assert.equal(code, 1);
       assert.match(out, new RegExp(`Cannot go back ${reach + 1} weeks\\. Costpoint offers ${reach} past weeks\\.`));
+      assert.match(out, new RegExp(`Could not load ${reach + 1} weeks back`));
+      assert.doesNotMatch(out, /Authentication failed/);
+    });
+
+    test('a failed login with --back reports the login, not the week', async () => {
+      const { code, out } = await teWith({ COSTPOINT_PASSWORD: 'wrong' }, 'show', '--back', '2');
+      assert.equal(code, 1);
+      assert.match(out, /Authentication failed/);
+      assert.doesNotMatch(out, /Could not load/);
     });
   });
 

@@ -94,16 +94,22 @@ async function connect(options = {}) {
     throw new Error('--prev and --back are only supported in direct mode (COSTPOINT_DIRECT=true).');
   }
   const week = back ? weekLabel(back) : null;
-  const s = spin(week ? `Authenticating and loading ${week}...` : 'Authenticating...');
+  let s = spin('Authenticating...');
+  let loggedIn = false;
+  const onLogin = () => {
+    loggedIn = true;
+    s.succeed('Authenticated');
+    s = spin(`Loading ${week}...`);
+  };
   let cp;
   try {
-    cp = await launchForPeriod(requireCredentials(), back);
+    cp = await launchForPeriod(requireCredentials(), back, { onLogin });
   } catch (e) {
-    s.fail(week ? `Could not load ${week}` : 'Authentication failed');
+    s.fail(loggedIn ? `Could not load ${week}` : 'Authentication failed');
     throw e;
   }
-  s.succeed('Authenticated');
-  if (week) spin(`Loading ${week}...`).succeed(`${week[0].toUpperCase()}${week.slice(1)} loaded`);
+  if (loggedIn) s.succeed(`${week[0].toUpperCase()}${week.slice(1)} loaded`);
+  else s.succeed('Authenticated');
   return cp;
 }
 

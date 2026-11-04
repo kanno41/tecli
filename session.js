@@ -10,7 +10,9 @@ const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 // 1 = the week before it, ...). A past-week session is launched fresh and
 // moved to its period before anything else runs (same rule as signing).
 // preloadPrevious only applies to the active week in direct mode.
-async function launchForPeriod(creds, period, { preloadPrevious = false } = {}) {
+// onLogin runs once the login worked, before a past week is selected, so a
+// caller can tell a failed login from a failed week selection
+async function launchForPeriod(creds, period, { preloadPrevious = false, onLogin } = {}) {
   const { url, username, password, useDirect } = creds;
   if (!useDirect) {
     if (period !== 0) {
@@ -23,6 +25,7 @@ async function launchForPeriod(creds, period, { preloadPrevious = false } = {}) 
   }
   const cp = await DirectClient.launch(url, username, password);
   try {
+    if (onLogin) onLogin();
     assertBackReachable(period, cp.getPeriods().length);
     await cp.selectPeriod(period);
   } catch (e) {
