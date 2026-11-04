@@ -32,6 +32,7 @@ const CHILD = {
   CHARGE_COMBINED: 108,
   CHARGE_FLAG: 112,
   CHARGE_PAY_TYPE: 376,
+  CHARGE_WORK_LOCATION: 348,
   CHARGE_PROJECT_ID: 400,
 };
 
@@ -40,10 +41,12 @@ const CHARGE = {
   PROJECT: 1,
   ACCOUNT: 4,
   CODE: 5,
+  WORK_LOCATION: 6,
   PAY_TYPE: 15,
   COMBINED: 24,
   CODE_DESC: 25,
   FLAG: 26,
+  IS_FAVORITE: 28,
   PROJECT_ID: 32,
   ALT_CODE: 53,
 };
@@ -219,7 +222,9 @@ class Db {
     row[CHARGE.COMBINED] = multi ? charge.code + charge.payType : charge.code;
     row[CHARGE.CODE_DESC] = charge.desc;
     row[CHARGE.FLAG] = '1';
-    row[CHARGE.PROJECT_ID] = charge.code;
+    row[CHARGE.WORK_LOCATION] = charge.workLocation || '';
+    row[CHARGE.IS_FAVORITE] = charge.favorite ? 'Y' : 'N';
+    row[CHARGE.PROJECT_ID] = charge.parentBranch === undefined ? charge.code : charge.parentBranch;
     row[CHARGE.ALT_CODE] = charge.code;
     return row;
   }

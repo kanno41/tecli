@@ -134,6 +134,7 @@ const CHILD_402 = {
   UDT10_ID_U2_CHG_LKUP: 376,
   UDT_FROM_LKP_FL: 393,
   YEAR_NO_CD: 398,
+  UDT03_ID_U2_CHG_LKUP: 348,
   UDT02_DISPLAY: 400,
 };
 
@@ -193,17 +194,52 @@ test('staging a line and copying a charge write the live child columns', () => {
   assert.equal(row[394], 'N');
   assert.equal(row[393], '');
 
+  client.lookupCol = DirectClient.resolveLookupColumns(LOOKUP_NAMES);
   const k2 = new Array(56).fill('');
-  k2[5] = 'PROJ';
+  k2[1] = 'H01980';
+  k2[5] = 'H01980.A.N102.210';
   k2[15] = 'REG';
-  k2[24] = 'PROJ.REG';
+  k2[24] = 'H01980.A.N102.210';
   k2[26] = '1';
-  k2[32] = 'PROJ-ID';
+  k2[32] = 'PARENT';
+  k2[53] = 'H01980.A.N102.210';
   client._applyCharge(k2);
+  assert.equal(row[104], 'H01980');
   assert.equal(row[377], 'REG');
-  assert.equal(row[401], 'PROJ-ID');
+  assert.equal(row[401], 'H01980.A.N102.210');
   assert.equal(row[376], '');
   assert.equal(row[400], '');
+});
+
+// captured/past-week-add/015, the K2 TC_UDT02_CHARGE_LKP OPEN_RS reply
+const LOOKUP_NAMES = layout(56, {
+  DESC_DISPLAY: 0,
+  CHARGE_BRANCH_CD: 1,
+  UDT02_ID: 5,
+  UDT03_ID: 6,
+  UDT10_ID: 15,
+  CHARGE_CD: 24,
+  CHARGE_TREE_CD: 26,
+  IS_FAVORITE: 28,
+  PARENT_CHG_BR_CD: 32,
+  UDT02_DISPLAY: 53,
+});
+
+const LOOKUP_CAPTURE = path.join(__dirname, '../captured/past-week-add/015-res.txt');
+
+test(
+  'the charge lookup columns resolve from the capture by name',
+  { skip: !fs.existsSync(LOOKUP_CAPTURE) && 'no captured/' },
+  () => {
+    const [names] = protocol.columnNames(fs.readFileSync(LOOKUP_CAPTURE, 'utf8'));
+    assert.deepEqual(DirectClient.resolveLookupColumns(names), DirectClient.CAPTURE_LOOKUP_COL);
+  }
+);
+
+test('charge lookup resolution fails loudly on a missing name', () => {
+  const names = LOOKUP_NAMES.slice();
+  names[1] = 'OTHER';
+  assert.throws(() => DirectClient.resolveLookupColumns(names), /CHARGE_BRANCH_CD not found/);
 });
 
 // A client that skipped launch must not fall back to a stale layout

@@ -153,6 +153,26 @@ describe('mock favorites', () => {
     assert.deepEqual(calls[1], ['PROJ.C.300', 'REG', { workLocation: undefined }]);
   });
 
+  // Live trace (tecli-a1t.12): the branch differs from the code, and the
+  // per-code lookup returns a non-favorite row first with no work location
+  const addH01980 = db => {
+    const base = { code: 'H01980.A.N102.210', payType: '', desc: 'Tech Integration', project: 'H01980' };
+    db.charges.push(
+      { ...base, account: 'ZTC-IL-000-0000', parentBranch: 'H01980', workLocation: '' },
+      { ...base, account: 'ZTC-IL-000-0000', parentBranch: '', workLocation: '62226', favorite: true }
+    );
+    db.favorites.push({ code: base.code, payType: '', desc: base.desc });
+  };
+
+  test('a favorite whose branch differs from its code saves', async () => {
+    addH01980(mock.db);
+    const cp = await mock.launch();
+    await cp.addFromFavorite(2);
+    await cp.save();
+    const again = await mock.launch();
+    assert.ok(again.getData().projects.some(p => p.code === 'H01980.A.N102.210'));
+  });
+
   test('a favorite index out of range is an error', async () => {
     const cp = await mock.launch();
     await assert.rejects(() => cp.addFromFavorite(9), /out of range/);

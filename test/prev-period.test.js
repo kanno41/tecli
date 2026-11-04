@@ -30,6 +30,8 @@ function makeStubClient(periodIdx) {
   const client = Object.create(DirectClient.prototype);
   client.parentCol = DirectClient.CAPTURE_PARENT_COL;
   client.childCol = DirectClient.CAPTURE_CHILD_COL;
+  client.lookupCol = DirectClient.CAPTURE_LOOKUP_COL;
+  client._resolveLookupColumns = () => {};
   client.sid = 'SID';
   client.lastPutId = 0;
   client.periodIdx = periodIdx;

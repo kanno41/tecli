@@ -11,6 +11,7 @@ const { PARENT, CHILD, CHARGE, toNumber } = require('./state');
 const SESSION_NOT_VALID = 'parent.onServletException("Session not valid");\nsession not valid';
 const RIGHTS_ERROR = 'You do not have rights to execute this process';
 const EXPLANATION_ERROR = 'Explanation or Reject Reason is required.';
+const INVALID_CHARGE_ERROR = 'Invalid charge.';
 const DELETE_INVALID_LINE_ERROR =
   'One or more charge lines were invalid and could not be added to timesheet because certain required values were invalid or could not be calculated.';
 const PENDING_ROW = '-59999';
@@ -114,7 +115,8 @@ function chargeRows(env, charges) {
 function favoriteCharges(env) {
   const { db } = env;
   return db.favorites.map(f => {
-    const found = db.chargesFor(f.code).find(c => c.payType === f.payType);
+    const matches = db.chargesFor(f.code).filter(c => (c.payType || '') === (f.payType || ''));
+    const found = matches.find(c => c.favorite) || matches[0];
     return found || { code: f.code, payType: f.payType, desc: f.desc, project: '', account: '' };
   });
 }
@@ -264,6 +266,7 @@ const CHILD_NAMES = {
   [CHILD.CHARGE_COMBINED]: 'CHARGE_CD_U2_CHG_LKUP',
   [CHILD.CHARGE_FLAG]: 'CHARGE_TREE_CD_U2_CHG_LKUP',
   [CHILD.CHARGE_PAY_TYPE]: 'UDT10_ID_U2_CHG_LKUP',
+  [CHILD.CHARGE_WORK_LOCATION]: 'UDT03_ID_U2_CHG_LKUP',
   [CHILD.CHARGE_PROJECT_ID]: 'UDT02_DISPLAY',
   [CHILD.SEQ]: 'LINE_NO',
   150: 'COST_FL',
@@ -280,6 +283,20 @@ const CHILD_NAMES = {
   398: 'YEAR_NO_CD',
 };
 
+// Charge lookup columns direct.js resolves by name (captured/past-week-add/015)
+const CHARGE_NAMES = {
+  [CHARGE.DESC]: 'DESC_DISPLAY',
+  [CHARGE.PROJECT]: 'CHARGE_BRANCH_CD',
+  [CHARGE.CODE]: 'UDT02_ID',
+  [CHARGE.WORK_LOCATION]: 'UDT03_ID',
+  [CHARGE.PAY_TYPE]: 'UDT10_ID',
+  [CHARGE.COMBINED]: 'CHARGE_CD',
+  [CHARGE.FLAG]: 'CHARGE_TREE_CD',
+  [CHARGE.IS_FAVORITE]: 'IS_FAVORITE',
+  [CHARGE.PROJECT_ID]: 'PARENT_CHG_BR_CD',
+  [CHARGE.ALT_CODE]: 'UDT02_DISPLAY',
+};
+
 function columnNames(named, width) {
   return Array.from({ length: width }, (_, i) => named[i] || 'COL' + i);
 }
@@ -290,6 +307,9 @@ function openRs(cmd, env) {
   if (cmd.codes.I === 'TC_UDT02_CHARGE_LKP') env.session.favoritesPrimed = false;
   if (k === 0) return [{ rsKey: k, cmdCd: 201, columnNames: columnNames(PARENT_NAMES, env.db.cols.parent) }];
   if (k === 1) return [{ rsKey: k, cmdCd: 201, columnNames: columnNames(CHILD_NAMES, env.db.cols.child) }];
+  if (cmd.codes.I === 'TC_UDT02_CHARGE_LKP') {
+    return [{ rsKey: k, cmdCd: 201, columnNames: columnNames(CHARGE_NAMES, env.db.cols.charge) }];
+  }
   return [{ rsKey: k, cmdCd: 201 }];
 }
 
@@ -348,11 +368,14 @@ function validateCharge(row, env) {
   row[CHILD.DESC] = c.desc;
   row[CHILD.ACCOUNT] = c.account;
   row[CHILD.PAY_TYPE] = c.payType;
-  row[CHILD.CHARGE_PROJECT] = c.code;
-  row[CHILD.CHARGE_COMBINED] = c.code;
-  row[CHILD.CHARGE_FLAG] = '1';
-  row[CHILD.CHARGE_PAY_TYPE] = c.payType;
-  row[CHILD.CHARGE_PROJECT_ID] = c.code;
+  // Live keeps the charge columns a lookup copied in (trace, tecli-a1t.12)
+  if (!row[CHILD.CHARGE_PROJECT]) {
+    row[CHILD.CHARGE_PROJECT] = c.project;
+    row[CHILD.CHARGE_COMBINED] = c.code;
+    row[CHILD.CHARGE_FLAG] = '1';
+    row[CHILD.CHARGE_PAY_TYPE] = c.payType;
+    row[CHILD.CHARGE_PROJECT_ID] = c.code;
+  }
   if (!row[CHILD.WORK_LOCATION]) row[CHILD.WORK_LOCATION] = db.employee.zip;
   return null;
 }
@@ -408,11 +431,20 @@ const ACTIONS = {
     row[CHILD.DESC] = sel[CHARGE.DESC];
     row[CHILD.ACCOUNT] = sel[CHARGE.ACCOUNT];
     if (sel[CHARGE.PAY_TYPE]) row[CHILD.PAY_TYPE] = sel[CHARGE.PAY_TYPE];
-    row[CHILD.CHARGE_PROJECT] = sel[CHARGE.CODE];
-    row[CHILD.CHARGE_COMBINED] = sel[CHARGE.COMBINED];
-    row[CHILD.CHARGE_FLAG] = sel[CHARGE.FLAG];
-    row[CHILD.CHARGE_PAY_TYPE] = sel[CHARGE.PAY_TYPE];
-    row[CHILD.CHARGE_PROJECT_ID] = sel[CHARGE.PROJECT_ID];
+    // Live echoes the charge columns the client copied from the lookup row
+    // (trace, tecli-a1t.12) and checks them on save (chargeError)
+    const copied = [
+      [CHILD.CHARGE_PROJECT, CHARGE.PROJECT],
+      [CHILD.CHARGE_COMBINED, CHARGE.COMBINED],
+      [CHILD.CHARGE_FLAG, CHARGE.FLAG],
+      [CHILD.CHARGE_PAY_TYPE, CHARGE.PAY_TYPE],
+      [CHILD.CHARGE_WORK_LOCATION, CHARGE.WORK_LOCATION],
+      [CHILD.CHARGE_PROJECT_ID, CHARGE.ALT_CODE],
+    ];
+    for (const [to, from] of copied) if (!row[to]) row[to] = sel[from];
+    line.charge = sel;
+    // A charge with a work location sets it (source C, as the browser sees)
+    if (sel[CHARGE.WORK_LOCATION]) row[CHILD.WORK_LOCATION] = sel[CHARGE.WORK_LOCATION];
     if (!row[CHILD.WORK_LOCATION]) row[CHILD.WORK_LOCATION] = db.employee.zip;
   },
 
@@ -510,6 +542,16 @@ function commitSign(idx, env) {
   if (idx === 0) ctx.suppress204 = true;
 }
 
+// Live refuses a line whose branch or display code is not the selected
+// charge's (CHARGE_BRANCH_CD, UDT02_DISPLAY; trace saves #23/#61, tecli-a1t.12)
+function chargeError(line) {
+  const sel = line.charge;
+  if (!sel) return false;
+  return (
+    line.row[CHILD.CHARGE_PROJECT] !== sel[CHARGE.PROJECT] || line.row[CHILD.CHARGE_PROJECT_ID] !== sel[CHARGE.ALT_CODE]
+  );
+}
+
 function commitBuffer(idx, buf, env) {
   const { db, session, ctx, faults, quirks } = env;
   const period = db.period(idx);
@@ -528,6 +570,7 @@ function commitBuffer(idx, buf, env) {
   if (buf.lines.some(l => int(l.rowNum) < 0 && !l.row[CHILD.ACCOUNT])) {
     return { rescd: 0, error: 'Account required' };
   }
+  if (buf.lines.some(l => int(l.rowNum) < 0 && chargeError(l))) return { rescd: 0, error: INVALID_CHARGE_ERROR };
   db.commitLines(idx, buf.lines);
   // Live: after a committed past-week save the next X>0 read again needs the
   // R=AUTO fetch first (sign-bisect, 2026-10-27, tecli-lok)

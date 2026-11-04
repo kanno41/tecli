@@ -166,6 +166,7 @@ const CHILD_COL_NAMES = {
   CHARGE_COMBINED: 'CHARGE_CD_U2_CHG_LKUP',
   CHARGE_FLAG: 'CHARGE_TREE_CD_U2_CHG_LKUP',
   CHARGE_PAY_TYPE: 'UDT10_ID_U2_CHG_LKUP',
+  CHARGE_WORK_LOCATION: 'UDT03_ID_U2_CHG_LKUP',
   CHARGE_PROJECT_ID: 'UDT02_DISPLAY',
 };
 
@@ -188,10 +189,42 @@ const CHILD_COL = {
   CHARGE_COMBINED: 108,
   CHARGE_FLAG: 112,
   CHARGE_PAY_TYPE: 376,
+  CHARGE_WORK_LOCATION: 348,
   CHARGE_PROJECT_ID: 400,
 };
 
 const resolveChildColumns = (names, rowWidth) => resolveColumns('child', CHILD_COL_NAMES, names, rowWidth);
+
+// Charge lookup (K2 TC_UDT02_CHARGE_LKP) columns, by maObjId name from the
+// lookup's OPEN_RS reply. The branch (CHARGE_BRANCH_CD) differs from the code
+// (UDT02_ID) for project charges such as H01980.A.N102.210; copying the wrong
+// one into the line fails the save with "Invalid charge." (tecli-a1t.12).
+const LOOKUP_COL_NAMES = {
+  DESC: 'DESC_DISPLAY',
+  BRANCH: 'CHARGE_BRANCH_CD',
+  CODE: 'UDT02_ID',
+  WORK_LOCATION: 'UDT03_ID',
+  PAY_TYPE: 'UDT10_ID',
+  CHARGE_CD: 'CHARGE_CD',
+  TREE: 'CHARGE_TREE_CD',
+  IS_FAVORITE: 'IS_FAVORITE',
+  DISPLAY: 'UDT02_DISPLAY',
+};
+
+// Layout of the 56-column lookup captures, for test stubs only (CAPTURE_LOOKUP_COL)
+const LOOKUP_COL = {
+  DESC: 0,
+  BRANCH: 1,
+  CODE: 5,
+  WORK_LOCATION: 6,
+  PAY_TYPE: 15,
+  CHARGE_CD: 24,
+  TREE: 26,
+  IS_FAVORITE: 28,
+  DISPLAY: 53,
+};
+
+const resolveLookupColumns = names => resolveColumns('charge lookup', LOOKUP_COL_NAMES, names);
 
 // Revision explanation column indices (K2 = TMMTS_TS_REVISION_EXP)
 const REV_COL = {
@@ -348,6 +381,21 @@ class DirectClient {
 
   set childCol(cols) {
     this._childCol = cols;
+  }
+
+  /** Charge lookup column indices, resolved when the lookup opens. */
+  get lookupCol() {
+    if (!this._lookupCol) throw new Error('Charge lookup columns are not resolved; open the lookup first');
+    return this._lookupCol;
+  }
+
+  set lookupCol(cols) {
+    this._lookupCol = cols;
+  }
+
+  /** Resolve lookupCol from a K2 OPEN_RS reply */
+  _resolveLookupColumns(openRsResp) {
+    this.lookupCol = resolveLookupColumns(protocol.columnNames(openRsResp)[0]);
   }
 
   /**
@@ -741,6 +789,7 @@ class DirectClient {
     const openResp = await this._postServlet(this._buildOpenFavoritesLookup());
     const openErr = protocol.checkErrors(protocol.parseResponse(openResp));
     if (openErr) throw new Error('Favorites open error: ' + openErr);
+    this._resolveLookupColumns(openResp);
 
     // Categories-view primer (LVL=1 ROW=-1, no code filter). This is what the
     // browser sends immediately after OPEN_RS when the lookup dialog first
@@ -755,18 +804,19 @@ class DirectClient {
     const k2Data = protocol.extract204(queryParsed, 2);
     if (!k2Data || k2Data.rows.length === 0) return [];
 
+    const lc = this.lookupCol;
     const seen = new Set();
     const favorites = [];
     for (const row of k2Data.rows) {
-      const code = row[5] || '';
+      const code = row[lc.CODE] || '';
       if (!code) continue;
-      const payType = row[15] || '';
+      const payType = row[lc.PAY_TYPE] || '';
       const key = code + '|' + payType;
       if (seen.has(key)) continue;
       seen.add(key);
       favorites.push({
         code,
-        description: row[0] || '',
+        description: row[lc.DESC] || '',
         payType,
       });
     }
@@ -1313,13 +1363,15 @@ class DirectClient {
    */
   _applyCharge(k2Row) {
     const col = this.childCol;
+    const lc = this.lookupCol;
     const childRow = this.childData.rows[this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0)];
-    childRow[col.CHARGE_PROJECT] = k2Row[5] || '';
+    childRow[col.CHARGE_PROJECT] = k2Row[lc.BRANCH] || '';
     // Combined code+payType (e.g., ZLEAVE.FTBRHB)
-    childRow[col.CHARGE_COMBINED] = k2Row[24] || '';
-    childRow[col.CHARGE_FLAG] = k2Row[26] || '';
-    childRow[col.CHARGE_PAY_TYPE] = k2Row[15] || '';
-    childRow[col.CHARGE_PROJECT_ID] = k2Row[32] || '';
+    childRow[col.CHARGE_COMBINED] = k2Row[lc.CHARGE_CD] || '';
+    childRow[col.CHARGE_FLAG] = k2Row[lc.TREE] || '';
+    childRow[col.CHARGE_PAY_TYPE] = k2Row[lc.PAY_TYPE] || '';
+    childRow[col.CHARGE_WORK_LOCATION] = k2Row[lc.WORK_LOCATION] || '';
+    childRow[col.CHARGE_PROJECT_ID] = k2Row[lc.DISPLAY] || '';
   }
 
   async _resolveChargeOnServer(code, payType) {
@@ -1329,6 +1381,7 @@ class DirectClient {
     const openRsParsed = protocol.parseResponse(openRsResp);
     const openRsErr = protocol.checkErrors(openRsParsed);
     if (openRsErr) throw new Error('Charge lookup OPEN_RS error: ' + openRsErr);
+    this._resolveLookupColumns(openRsResp);
 
     // Step 2: HLKP query to fetch available charges
     const hlkpBody = this._buildHlkpQuery(code);
@@ -1345,7 +1398,7 @@ class DirectClient {
 
     // Select the charge row
     let selectedIdx;
-    const availablePayTypes = k2Data.rows.map(r => r[15] || '');
+    const availablePayTypes = k2Data.rows.map(r => r[this.lookupCol.PAY_TYPE] || '');
     const hasDistinctPayTypes = availablePayTypes.some(pt => pt !== '');
     debug(
       'K2 lookup for ' +
@@ -3411,16 +3464,9 @@ class DirectClient {
   // Command builders — charge lookup (multi-charge resolution)
   // =========================================================================
 
-  /**
-   * Find the charge row matching the desired pay type in HLKP results.
-   * Uses K2 col[15] (PAY_TYPE) for matching — verified from captured HLKP data.
-   */
+  /** Index of the HLKP lookup row with the given pay type, or -1 */
   _findChargeRow(rows, payType) {
-    const K2_PAY_TYPE_COL = 15;
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i][K2_PAY_TYPE_COL] === payType) return i;
-    }
-    return -1;
+    return rows.findIndex(r => r[this.lookupCol.PAY_TYPE] === payType);
   }
 
   /**
@@ -3859,7 +3905,9 @@ DirectClient.requestTimeoutMs = requestTimeoutMs;
 DirectClient.MAX_RESPONSE_BYTES = MAX_RESPONSE_BYTES;
 DirectClient.resolveParentColumns = resolveParentColumns;
 DirectClient.resolveChildColumns = resolveChildColumns;
+DirectClient.resolveLookupColumns = resolveLookupColumns;
 DirectClient.CAPTURE_PARENT_COL = PARENT_COL;
 DirectClient.CAPTURE_CHILD_COL = CHILD_COL;
+DirectClient.CAPTURE_LOOKUP_COL = LOOKUP_COL;
 DirectClient.TRACE_MAX_BYTES = TRACE_MAX_BYTES;
 module.exports = DirectClient;
