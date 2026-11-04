@@ -842,7 +842,27 @@ class DirectClient {
     if (index < 0 || index >= favs.length) {
       throw new Error('Favorite index ' + index + ' out of range (0-' + (favs.length - 1) + ')');
     }
-    const fav = favs[index];
+    return this._addFavorite(favs[index], { payType, workLocation });
+  }
+
+  /**
+   * Add a code the way a favorites pick would when it is one of the user's
+   * favorites (te add, tecli-a1t.12), else through add(). A pay type picks
+   * among favorites of the code. Returns the favorite used, or null.
+   */
+  async addCode(code, payType, { workLocation } = {}) {
+    const favs = await this.getFavorites({ keepLine: true });
+    const wanted = code.toUpperCase();
+    const matches = favs.filter(f => f.code.toUpperCase() === wanted);
+    const fav = payType ? matches.find(f => f.payType === payType) : matches.length === 1 ? matches[0] : null;
+    if (!fav) {
+      await this.add(code, payType, { workLocation });
+      return null;
+    }
+    return this._addFavorite(fav, { workLocation });
+  }
+
+  async _addFavorite(fav, { payType, workLocation } = {}) {
     if (payType && payType !== fav.payType) {
       await this.add(fav.code, payType, { workLocation });
       return fav;
@@ -1418,11 +1438,16 @@ class DirectClient {
     const hlkpErr = protocol.checkErrors(hlkpParsed);
     if (hlkpErr) throw new Error('Charge lookup HLKP error: ' + hlkpErr);
 
-    // Extract K2 204 data (lookup results)
-    const k2Data = protocol.extract204(hlkpParsed, 2);
-    if (!k2Data || k2Data.rows.length === 0) {
+    // Only rows for the code itself, not other codes the filter let through
+    const found = protocol.extract204(hlkpParsed, 2);
+    const wanted = code.toUpperCase();
+    const exact = found
+      ? found.rows.flatMap((r, i) => ((r[this.lookupCol.CODE] || '').toUpperCase() === wanted ? [i] : []))
+      : [];
+    if (exact.length === 0) {
       throw new Error('No charges found for ' + code);
     }
+    const k2Data = { rows: exact.map(i => found.rows[i]), rowNums: exact.map(i => found.rowNums[i]) };
 
     // Select the charge row
     let selectedIdx;

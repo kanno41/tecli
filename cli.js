@@ -382,16 +382,15 @@ withWeekOptions(
       const explicitLocation = normalizeWorkLocation(options.location);
       if (!code) requireDirect('Picking from favorites');
       const cp = await connect(options);
-      let fromFavorites = false;
+      let picked = null;
 
       if (!code) {
-        const picked = await pickFromFavorites(cp);
+        picked = await pickFromFavorites(cp);
         if (!picked) {
           await cp.close();
           return;
         }
         code = picked.code;
-        fromFavorites = true;
         if (!payType) payType = picked.payType || undefined;
       } else {
         const alias = resolveAlias(code);
@@ -401,12 +400,21 @@ withWeekOptions(
         }
       }
 
-      const label = payType ? `${code} (${payType})` : code;
       const ask = options.ask && !explicitLocation && process.stdin.isTTY;
-      const s = ask ? null : spin(`Adding ${label}...`);
-      await cp.add(code, payType, {
-        workLocation: ask ? askWorkLocation : explicitLocation,
-      });
+      const s = ask ? null : spin(`Adding ${payType ? `${code} (${payType})` : code}...`);
+      const addOptions = { workLocation: ask ? askWorkLocation : explicitLocation };
+      // Favorites are added from their favorites row, like a TUI [f] pick,
+      // a typed one included (tecli-a1t.12)
+      let fav = null;
+      if (picked) fav = await cp.addFromFavorite(picked.index, { payType, ...addOptions });
+      else if (requireCredentials().useDirect) fav = await cp.addCode(code, payType, addOptions);
+      else await cp.add(code, payType, addOptions);
+      const fromFavorites = Boolean(fav);
+      if (fav) {
+        code = fav.code;
+        if (!payType) payType = fav.payType || undefined;
+      }
+      const label = payType ? `${code} (${payType})` : code;
       if (s) s.succeed(`Added ${label}`);
       else console.log(chalk.green(`  Added ${label}`));
 
@@ -466,7 +474,7 @@ async function pickFromFavorites(cp) {
     console.log(chalk.red(`  Invalid selection: ${trimmed}`));
     return null;
   }
-  return favs[n - 1];
+  return { ...favs[n - 1], index: n - 1 };
 }
 
 // Favorites belong to the user, not a week, so there is no week option

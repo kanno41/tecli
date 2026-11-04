@@ -195,6 +195,51 @@ describe('te against the mock', () => {
         assert.ok(!mock.db.favorites.some(f => f.code === 'PROJ.D.400'));
       }
     );
+
+    // Like a TUI [f] pick (tecli-a1t.12): the favorite's own lookup row, not
+    // row 0 of the per-code lookup
+    // Two lookup rows, only the favorite one carries a work location
+    const addH01980 = () => {
+      const base = { code: 'H01980.A.N102.210', payType: '', desc: 'Tech Integration', project: 'H01980' };
+      mock.db.charges.push(
+        { ...base, account: 'ZTC-IL-000-0000', parentBranch: 'H01980', workLocation: '' },
+        { ...base, account: 'ZTC-IL-000-0000', parentBranch: '', workLocation: '62226', favorite: true }
+      );
+      mock.db.favorites.push({ code: base.code, payType: '', desc: base.desc });
+    };
+
+    test('a favorite code is added from its favorites row', async () => {
+      addH01980();
+      const { code, out } = await te('add', 'h01980.a.n102.210');
+      assert.equal(code, 0, out);
+      assert.match(out, /Added H01980\.A\.N102\.210/);
+      assert.equal(lineOf(0, 'H01980.A.N102.210')[8], '62226');
+    });
+
+    test(
+      'a pick from the favorites list is added from its favorites row',
+      { skip: !hasScript() && 'needs util-linux script(1)' },
+      async () => {
+        addH01980();
+        const { code, out, unanswered } = await teOnTTY(['add'], [[/Pick favorite \[1-3\]/, '3']]);
+        assert.equal(code, 0, out);
+        assert.equal(unanswered, 0, out);
+        assert.equal(lineOf(0, 'H01980.A.N102.210')[8], '62226');
+      }
+    );
+
+    test("a favorite code gets the favorite's pay type, an explicit one wins", async () => {
+      mock.db.favorites.push({ code: 'PROJ.M.400', payType: 'RHB', desc: 'Delta Multi' });
+      let { code, out } = await te('add', 'PROJ.M.400');
+      assert.equal(code, 0, out);
+      assert.match(out, /Added PROJ\.M\.400 \(RHB\)/);
+      ({ code, out } = await te('add', 'PROJ.M.400', 'REG', '--back', '1'));
+      assert.equal(code, 0, out);
+      assert.match(out, /Added PROJ\.M\.400 \(REG\)/);
+      const pay = period => mock.db.period(period).lines.find(l => l[6] === 'PROJ.M.400')[16];
+      assert.equal(pay(0), 'RHB');
+      assert.equal(pay(1), 'REG');
+    });
   });
 
   describe('sign', () => {

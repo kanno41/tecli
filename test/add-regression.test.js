@@ -186,6 +186,46 @@ describe('_resolveChargeOnServer charge selection', () => {
     assert.equal(selected.k2Row[5], 'ZLEAVE.CMP');
   });
 
+  test('a row for another code is never selected', async () => {
+    const client = makeStubClient();
+    client._stagePendingLine();
+    const lookupRow = (code, payType) => {
+      const row = new Array(40).fill('');
+      row[5] = code;
+      row[15] = payType;
+      return row;
+    };
+    const hlkpResponse = codec.buildResponse([
+      {
+        rsKey: 2,
+        cmdCd: 204,
+        start: 0,
+        end: 3,
+        slot: codec.encode204Slot(
+          {
+            rowNums: ['0', '1', '2'],
+            rowFlags: [0, 0, 0],
+            rows: [lookupRow('PROJ.A.1001', 'REG'), lookupRow('PROJ.A.100', 'RHB'), lookupRow('proj.a.100', 'REG')],
+          },
+          40
+        ),
+      },
+    ]);
+    client._buildOpenRsChargeLookup = () => 'OPEN_RS';
+    client._buildHlkpQuery = () => 'HLKP';
+    let selected = null;
+    client._buildChargeLkpOk = (k2Row, rowNum) => {
+      selected = rowNum;
+      return 'LKP_OK';
+    };
+    client._postServlet = async body => (body === 'HLKP' ? hlkpResponse : OK_RESPONSE);
+
+    await client._resolveChargeOnServer('PROJ.A.100', 'REG');
+    assert.equal(selected, '2');
+    await assert.rejects(() => client._resolveChargeOnServer('PROJ.A.100', undefined), /Available pay types: RHB, REG/);
+    await assert.rejects(() => client._resolveChargeOnServer('PROJ.A.10', 'REG'), /No charges found for PROJ\.A\.10/);
+  });
+
   test('multi-charge code: throws when no payType specified', () => {
     const row0 = new Array(40).fill('');
     row0[5] = '62226';

@@ -80,7 +80,7 @@ te add PROJ.M.400 RHB -f      # add a new code and save it to favorites
 te add pto                    # shortcut: pto, personal, flex, lwop, holiday, holdefer
 ```
 
-On a TTY, `te add <code>` without `-f` asks `Also add ... to your favorites? (y/N)`. A favorite that cannot be saved is a warning; the line is still added.
+A code that is one of your favorites is added like a favorites pick, with the favorite's pay type and work location unless you give others. On a TTY, `te add <code>` that is not a favorite and has no `-f` asks `Also add ... to your favorites? (y/N)`. A favorite that cannot be saved is a warning; the line is still added.
 
 Fix a processed past week. Costpoint reopens the week (Correct) and asks why; the CLI prompts for it, then reminds you to sign:
 
