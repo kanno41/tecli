@@ -369,7 +369,7 @@ function validateCharge(row, env) {
   row[CHILD.ACCOUNT] = c.account;
   row[CHILD.PAY_TYPE] = c.payType;
   // Live keeps the charge columns a lookup copied in (trace, tecli-a1t.12)
-  if (!row[CHILD.CHARGE_PROJECT]) {
+  if (!row[CHILD.CHARGE_COMBINED]) {
     row[CHILD.CHARGE_PROJECT] = c.project;
     row[CHILD.CHARGE_COMBINED] = c.code;
     row[CHILD.CHARGE_FLAG] = '1';

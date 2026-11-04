@@ -700,6 +700,10 @@ class DirectClient {
     // Step 3: Resolve charge via server-side lookup.
     await this._resolveChargeOnServer(code, payType);
 
+    await this._finishAdd(workLocation);
+  }
+
+  async _finishAdd(workLocation) {
     // Step 4: Post-charge validate — tells the server the charge is accepted.
     // Without this, the server's session state doesn't have the Account field
     // committed, causing "Account required" on save.
@@ -802,6 +806,7 @@ class DirectClient {
     if (queryErr) throw new Error('Favorites query error: ' + queryErr);
 
     const k2Data = protocol.extract204(queryParsed, 2);
+    this._favoriteRows = k2Data;
     if (!k2Data || k2Data.rows.length === 0) return [];
 
     const lc = this.lookupCol;
@@ -819,6 +824,9 @@ class DirectClient {
         description: row[lc.DESC] || '',
         payType,
       });
+      Object.defineProperty(favorites[favorites.length - 1], 'lookupRow', {
+        value: k2Data.rows.indexOf(row),
+      });
     }
     return favorites;
   }
@@ -835,7 +843,27 @@ class DirectClient {
       throw new Error('Favorite index ' + index + ' out of range (0-' + (favs.length - 1) + ')');
     }
     const fav = favs[index];
-    await this.add(fav.code, payType || fav.payType || undefined, { workLocation });
+    if (payType && payType !== fav.payType) {
+      await this.add(fav.code, payType, { workLocation });
+      return fav;
+    }
+    // Like the browser, select the favorites-list row itself: a per-code
+    // lookup can return a non-favorite row first, without the favorite's
+    // work location (tecli-a1t.12, captured/favorites-select-req.txt)
+    const rows = this._favoriteRows;
+    const k2Row = rows.rows[fav.lookupRow];
+    const newRowIdx = this.childData.rowNums.findIndex(n => parseInt(n, 10) < 0);
+    this.childData.rows[newRowIdx][this.childCol.UDT02_ID] = fav.code;
+    this._applyCharge(k2Row);
+    const resp = await this._postServlet(this._buildChargeLkpOk(k2Row, rows.rowNums[fav.lookupRow]));
+    if (resp.includes('onServletException')) {
+      throw new Error('Charge lookup OK caused server error. Session may be invalid.');
+    }
+    const parsed = protocol.parseResponse(resp);
+    const err = protocol.checkErrors(parsed);
+    if (err) throw new Error('Charge lookup OK error: ' + err);
+    this._applyRefresh(parsed);
+    await this._finishAdd(workLocation);
     return fav;
   }
 

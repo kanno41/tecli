@@ -146,11 +146,13 @@ describe('mock favorites', () => {
       calls.push(args);
       return add(...args);
     };
+    // The favorite's own lookup row is selected, with no per-code add()
     await cp.addFromFavorite(2, { workLocation: '20190' });
-    assert.deepEqual(calls[0], ['PROJ.C.300', undefined, { workLocation: '20190' }]);
+    assert.deepEqual(calls, []);
+    assert.equal(cp.pendingLine().workLocation, '20190');
     await cp.save();
     await cp.addFromFavorite(2, { payType: 'REG' });
-    assert.deepEqual(calls[1], ['PROJ.C.300', 'REG', { workLocation: undefined }]);
+    assert.deepEqual(calls[0], ['PROJ.C.300', 'REG', { workLocation: undefined }]);
   });
 
   // Live trace (tecli-a1t.12): the branch differs from the code, and the
@@ -171,6 +173,15 @@ describe('mock favorites', () => {
     await cp.save();
     const again = await mock.launch();
     assert.ok(again.getData().projects.some(p => p.code === 'H01980.A.N102.210'));
+  });
+
+  test('a favorite pick saves the work location of the favorite charge', async () => {
+    addH01980(mock.db);
+    const cp = await mock.launch();
+    await cp.addFromFavorite(2);
+    await cp.save();
+    const again = await mock.launch();
+    assert.equal(again.childData.rows.find(r => r[6] === 'H01980.A.N102.210')[8], '62226');
   });
 
   test('a favorite index out of range is an error', async () => {
