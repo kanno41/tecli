@@ -795,11 +795,10 @@
 
       body.querySelectorAll('.fav-add-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
-          const code = btn.dataset.code;
-          const payType = btn.dataset.paytype;
+          const favoriteIndex = parseInt(btn.dataset.index, 10);
           const workLocation = btn.closest('tr').querySelector('.fav-location').value.trim();
           hideAllModals();
-          await addProject(code, payType, period, false, workLocation);
+          await addFavorite(favoriteIndex, period, workLocation);
         });
       });
     } catch (err) {
@@ -832,8 +831,18 @@
     return Number.isInteger(period) ? period : null;
   }
 
-  async function addProject(code, payType, period, favorite = false, workLocation = '') {
-    if (period === null) {
+  function addProject(code, payType, period, favorite = false, workLocation = '') {
+    return postProject({ code, payType, period, favorite, workLocation });
+  }
+
+  // The server adds the favorites-list row itself, with the favorite's own
+  // pay type (tecli-a1t.12)
+  function addFavorite(favoriteIndex, period, workLocation = '') {
+    return postProject({ favoriteIndex, period, workLocation });
+  }
+
+  async function postProject(fields) {
+    if (fields.period === null) {
       showError('No editable week is shown.');
       return;
     }
@@ -842,7 +851,7 @@
       const response = await apiFetch('/api/project', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, payType, period, favorite, workLocation, offset: data ? data.offset : 0 }),
+        body: JSON.stringify({ ...fields, offset: data ? data.offset : 0 }),
       });
 
       const result = await response.json().catch(() => ({}));

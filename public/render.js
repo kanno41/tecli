@@ -44,7 +44,7 @@
   function favoritesTableHTML(favs) {
     let html =
       '<table class="leave-table"><thead><tr><th>Code</th><th>Pay Type</th><th>Description</th><th>Work Location</th><th></th></tr></thead><tbody>';
-    for (const f of favs) {
+    favs.forEach((f, index) => {
       html +=
         '<tr><td><code>' +
         escapeHtml(f.code) +
@@ -58,10 +58,10 @@
         '<td><input type="text" class="fav-location" maxlength="10" size="10" placeholder="default" /></td>' +
         '<td><button class="btn btn-sm btn-primary fav-add-btn" data-code="' +
         escapeHtml(f.code) +
-        '" data-paytype="' +
-        escapeHtml(f.payType || 'REG') +
+        '" data-index="' +
+        index +
         '">Add</button></td></tr>';
-    }
+    });
     return html + '</tbody></table>';
   }
 

@@ -273,9 +273,11 @@ async function saveWithExplanation(explanation) {
   return { success: true, message: 'Saved with revision explanation', saved };
 }
 
-// Add a project to one week's timesheet. A save that needs a revision
-// explanation is parked the same way as a cell save.
-async function addProject(code, payType, period, favorite = false, workLocation) {
+// Add a project to one week's timesheet. add(cp) stages the line: a typed
+// code through add(), a favorites pick through addFromFavorite() like the TUI
+// and MCP (tecli-a1t.12). A save that needs a revision explanation is parked
+// the same way as a cell save.
+async function addProject(add, period, favorite = false) {
   if (isProcessing) throw new Error('Another operation is in progress');
 
   isProcessing = true;
@@ -284,7 +286,7 @@ async function addProject(code, payType, period, favorite = false, workLocation)
   let warning = null;
   try {
     await withClient(async cp => {
-      await cp.add(code, payType, { workLocation });
+      await add(cp);
       if (favorite) {
         try {
           await cp.addToFavorites();
@@ -956,19 +958,25 @@ app.post('/api/save-with-explanation', async (req, res) => {
 });
 
 app.post('/api/project', async (req, res) => {
-  const { code, payType, favorite, workLocation } = req.body;
+  const { code, payType, favorite, favoriteIndex, workLocation } = req.body;
   const period = weekWindow.parsePeriod(req.body.period);
+  const fromFavorite = favoriteIndex !== undefined;
 
-  if (!code) {
+  if (fromFavorite && !(Number.isInteger(favoriteIndex) && favoriteIndex >= 0)) {
+    return res.status(400).json({ error: 'Invalid favorite index' });
+  }
+  if (!fromFavorite && !code) {
     return res.status(400).json({ error: 'Missing required field: code' });
   }
   if (period === null || period >= getPeriodCount()) {
     return res.status(400).json({ error: 'Invalid period' });
   }
 
-  const normalizedPayType = typeof payType === 'string' && payType.trim() ? payType.trim().toUpperCase() : 'REG';
+  // A favorites pick keeps the favorite's own pay type, blank included
+  const givenPayType = typeof payType === 'string' && payType.trim() ? payType.trim().toUpperCase() : undefined;
+  const normalizedPayType = givenPayType || (fromFavorite ? undefined : 'REG');
 
-  if (!VALID_PAY_TYPES.has(normalizedPayType)) {
+  if (normalizedPayType && !VALID_PAY_TYPES.has(normalizedPayType)) {
     return res.status(400).json({ error: 'Invalid pay type' });
   }
 
@@ -979,8 +987,13 @@ app.post('/api/project', async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
+  const options = { payType: normalizedPayType, workLocation: normalizedLocation };
+  const add = fromFavorite
+    ? cp => cp.addFromFavorite(favoriteIndex, options)
+    : cp => cp.add(code, normalizedPayType, { workLocation: normalizedLocation });
+
   try {
-    const result = await addProject(code, normalizedPayType, period, favorite === true, normalizedLocation);
+    const result = await addProject(add, period, !fromFavorite && favorite === true);
     if (result.revisionRequired) return res.json(result);
     res.json({
       success: true,

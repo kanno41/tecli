@@ -247,6 +247,25 @@ describe('web UI in a browser', () => {
     assert.equal(await page.locator('td.col-code', { hasText: 'PROJ.C.300' }).count(), 1);
   });
 
+  // A favorite with no pay type, whose per-code lookup returns a non-favorite
+  // row first (tecli-a1t.12)
+  test('Favorites Add picks the favorite row and keeps its blank pay type', async () => {
+    const base = { code: 'H01980.A.N102.210', payType: '', desc: 'Tech Integration', project: 'H01980' };
+    mock.db.charges.push(
+      { ...base, account: 'ZTC-IL-000-0000', parentBranch: 'H01980', workLocation: '' },
+      { ...base, account: 'ZTC-IL-000-0000', parentBranch: '', workLocation: '62226', favorite: true }
+    );
+    mock.db.favorites.push({ code: base.code, payType: '', desc: base.desc });
+    await page.click('#favorites-btn');
+    const row = page.locator('#favorites-modal-body tr', { hasText: base.code });
+    const load = reloaded();
+    await row.locator('.fav-add-btn').click();
+
+    const line = await until(() => mock.db.period(0).lines.find(l => l[CHILD.CODE] === base.code), 'the added line');
+    assert.equal(line[CHILD.WORK_LOCATION], '62226');
+    await load;
+  });
+
   test('Add Project without the checkbox or a location keeps the defaults', async () => {
     await page.click('#add-project-btn');
     await page.fill('#project-code', 'PROJ.C.300');
