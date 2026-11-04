@@ -1,0 +1,493 @@
+{
+ "employee": {
+  "name": "Doe, Jane Q.",
+  "id": "100001",
+  "zip": "12345"
+ },
+ "cols": {
+  "parent": 688,
+  "child": 402,
+  "charge": 56
+ },
+ "periodCount": 20,
+ "defaults": {
+  "parent": {
+   "8": "Salaried FT",
+   "9": "N",
+   "11": "0",
+   "12": "0",
+   "13": "1",
+   "22": "N",
+   "28": "N",
+   "32": "N",
+   "33": "01-SER40Y",
+   "34": "NA",
+   "36": "N",
+   "37": "1",
+   "38": "Y",
+   "39": "Y",
+   "198": "Y",
+   "205": "8",
+   "356": "W",
+   "357": "W",
+   "358": "W",
+   "363": "Y",
+   "370": "8",
+   "461": "W",
+   "462": "W",
+   "463": "W",
+   "468": "Y",
+   "475": "8",
+   "483": "Y",
+   "490": "8",
+   "491": "W",
+   "492": "W",
+   "493": "W",
+   "498": "Y",
+   "505": "8",
+   "506": "N",
+   "507": "N",
+   "508": "N",
+   "513": "Y",
+   "520": "0",
+   "521": "N",
+   "522": "N",
+   "523": "N",
+   "528": "Y",
+   "535": "0",
+   "566": "Y",
+   "569": "N",
+   "570": "N",
+   "571": "N",
+   "572": "N",
+   "577": "N",
+   "579": "N",
+   "580": "0",
+   "581": "N",
+   "582": "N",
+   "583": "N",
+   "584": "DISABLED",
+   "585": "Regular",
+   "586": "Overtime",
+   "587": "Total",
+   "593": "1",
+   "597": "N",
+   "601": "N",
+   "603": "N",
+   "604": "N",
+   "605": "N",
+   "606": "Y",
+   "607": "Y",
+   "608": "N",
+   "609": "Y",
+   "615": "QUARTER",
+   "616": "DISABLED",
+   "617": "REQUIRED",
+   "618": "MON",
+   "619": "N",
+   "620": "DISABLED",
+   "621": "DISABLED",
+   "623": "DISABLED",
+   "625": "Validate/Enter your In/Out and Non-Work Hours along with any comments below. Click Apply to certify that you have reviewed the entries on each day.",
+   "633": "W",
+   "634": "W",
+   "635": "W",
+   "636": "N",
+   "637": "Y",
+   "638": "Y",
+   "639": "Y",
+   "640": "Y",
+   "641": "Y",
+   "642": "N",
+   "643": "N",
+   "644": "N",
+   "645": "N",
+   "646": "N",
+   "647": "Y",
+   "648": "Y",
+   "649": "Y",
+   "650": "N",
+   "651": "N",
+   "652": "N",
+   "653": "N",
+   "654": "Y",
+   "655": "Y",
+   "656": "Y",
+   "657": "Y",
+   "658": "Y",
+   "659": "N",
+   "660": "N",
+   "661": "N",
+   "662": "N",
+   "663": "N",
+   "664": "N",
+   "665": "N",
+   "666": "Org",
+   "667": "N",
+   "668": "N",
+   "669": "100001",
+   "670": "N",
+   "671": "REG",
+   "677": "Doe",
+   "680": "N(5,Q)",
+   "681": "R",
+   "682": "Doe",
+   "683": "Y",
+   "686": "N",
+   "687": "Weekly for US-BiWeekly Payroll"
+  },
+  "child": {
+   "0": "N/A",
+   "7": " ",
+   "8": "12345",
+   "11": "XXX",
+   "14": "01.001.00001",
+   "15": "0001",
+   "109": "1",
+   "150": "N",
+   "151": "1",
+   "187": "100001",
+   "191": "0",
+   "193": "N(5,Q)",
+   "194": "Y",
+   "195": "N",
+   "197": "N",
+   "234": "N",
+   "235": "018",
+   "250": "N",
+   "321": "S",
+   "322": "C",
+   "323": "C",
+   "326": "E",
+   "329": "E",
+   "330": "E",
+   "336": "W",
+   "398": "2026"
+  }
+ },
+ "periods": [
+  {
+   "status": "O",
+   "closed": false,
+   "correctable": false,
+   "lines": [
+    {
+     "2": "Alpha Research",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.A.100",
+     "16": "REG",
+     "26": "8",
+     "27": "8",
+     "28": "8",
+     "29": "8",
+     "30": "8"
+    },
+    {
+     "2": "Beta Support",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.B.200",
+     "16": "REG",
+     "27": "1",
+     "29": "0.5"
+    }
+   ]
+  },
+  {
+   "status": "P",
+   "closed": true,
+   "correctable": true,
+   "lines": [
+    {
+     "2": "Alpha Research",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.A.100",
+     "16": "REG",
+     "26": "7.5",
+     "27": "7.5",
+     "28": "8",
+     "29": "8",
+     "30": "8"
+    },
+    {
+     "2": "Beta Support",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.B.200",
+     "16": "REG",
+     "27": "1",
+     "29": "0.5"
+    }
+   ]
+  },
+  {
+   "status": "S",
+   "closed": false,
+   "correctable": false,
+   "lines": [
+    {
+     "2": "Alpha Research",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.A.100",
+     "16": "REG",
+     "26": "6",
+     "27": "8",
+     "28": "8",
+     "29": "8",
+     "30": "8"
+    },
+    {
+     "2": "Beta Support",
+     "4": "ZTC-IL-000-0000",
+     "6": "PROJ.B.200",
+     "16": "REG",
+     "27": "1",
+     "29": "0.5"
+    }
+   ],
+   "signedOnce": true
+  }
+ ],
+ "periodTemplate": {
+  "status": "P",
+  "closed": true,
+  "correctable": true,
+  "lines": [
+   {
+    "2": "Alpha Research",
+    "4": "ZTC-IL-000-0000",
+    "6": "PROJ.A.100",
+    "16": "REG",
+    "26": "8",
+    "27": "8",
+    "28": "8",
+    "29": "8",
+    "30": "8"
+   },
+   {
+    "2": "Beta Support",
+    "4": "ZTC-IL-000-0000",
+    "6": "PROJ.B.200",
+    "16": "REG",
+    "27": "1",
+    "29": "0.5"
+   }
+  ]
+ },
+ "charges": [
+  {
+   "code": "PROJ.A.100",
+   "payType": "REG",
+   "desc": "Alpha Research",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.B.200",
+   "payType": "REG",
+   "desc": "Beta Support",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.C.300",
+   "payType": "REG",
+   "desc": "Gamma Overhead",
+   "project": "PROJ",
+   "account": "ZTC-DL-000-0000"
+  },
+  {
+   "code": "PROJ.M.400",
+   "payType": "REG",
+   "desc": "Delta Multi",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.M.400",
+   "payType": "RHB",
+   "desc": "Delta Multi",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "ZLEAVE.CMP",
+   "payType": "REG",
+   "desc": "PTO",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.CMP",
+   "payType": "RHB",
+   "desc": "PTO",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.PTB",
+   "payType": "REG",
+   "desc": "Personal Time",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.PTB",
+   "payType": "RHB",
+   "desc": "Personal Time",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.FTB",
+   "payType": "REG",
+   "desc": "Flexible Time",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.FTB",
+   "payType": "RHB",
+   "desc": "Flexible Time",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.HOL",
+   "payType": "REG",
+   "desc": "Holiday",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.HOL",
+   "payType": "RHB",
+   "desc": "Holiday",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.LWP",
+   "payType": "LWD",
+   "desc": "Leave Without Pay",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.LWP",
+   "payType": "REG",
+   "desc": "Leave Without Pay",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.HDF",
+   "payType": "RHB",
+   "desc": "Holiday Deferred",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "ZLEAVE.HDF",
+   "payType": "REG",
+   "desc": "Holiday Deferred",
+   "project": "ZLEAVE",
+   "account": "ZTC-LV-000-0000"
+  },
+  {
+   "code": "PROJ.D.400",
+   "payType": "REG",
+   "desc": "Charge PROJ.D.400",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.E.500",
+   "payType": "REG",
+   "desc": "Charge PROJ.E.500",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.F.600",
+   "payType": "REG",
+   "desc": "Charge PROJ.F.600",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.G.700",
+   "payType": "REG",
+   "desc": "Charge PROJ.G.700",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  },
+  {
+   "code": "PROJ.H.800",
+   "payType": "REG",
+   "desc": "Charge PROJ.H.800",
+   "project": "PROJ",
+   "account": "ZTC-IL-000-0000"
+  }
+ ],
+ "favorites": [
+  {
+   "code": "PROJ.A.100",
+   "payType": "REG",
+   "desc": "Alpha Research"
+  },
+  {
+   "code": "PROJ.B.200",
+   "payType": "REG",
+   "desc": "Beta Support"
+  }
+ ],
+ "leave": {
+  "balances": [
+   {
+    "description": "Flexible Time Bank",
+    "balance": 27.5,
+    "code": "FTB"
+   },
+   {
+    "description": "Paid Time Off (PTO)",
+    "balance": 120,
+    "code": "COMP"
+   },
+   {
+    "description": "Personal Time Bank",
+    "balance": 8,
+    "code": "PTB"
+   }
+  ],
+  "details": {
+   "COMP": [
+    {
+     "date": "2026-01-05",
+     "type": "Earned",
+     "hours": 6.15,
+     "reason": "",
+     "code": "COMP",
+     "desc": "Paid Time Off (PTO)"
+    },
+    {
+     "date": "2026-01-19",
+     "type": "Used",
+     "hours": -8,
+     "reason": "",
+     "code": "COMP",
+     "desc": "Paid Time Off (PTO)"
+    }
+   ],
+   "FTB": [
+    {
+     "date": "2026-02-02",
+     "type": "Banked",
+     "hours": 4,
+     "reason": "",
+     "code": "FTB",
+     "desc": "Flexible Time Bank"
+    }
+   ],
+   "PTB": []
+  }
+ }
+}

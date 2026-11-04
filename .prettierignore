@@ -1,0 +1,9 @@
+node_modules/
+captured/
+chrome/
+coverage/
+package-lock.json
+mock/fixture.json
+test/fixtures/
+.beads/
+*.md

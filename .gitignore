@@ -85,3 +85,8 @@ typings/
 
 
 # End of https://www.gitignore.io/api/node
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

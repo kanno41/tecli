@@ -6,11 +6,15 @@ const readline = require('readline');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const DirectClient = require('./direct');
-const Costpoint = require('./costpoint');
+const moment = require('moment');
 const { normalizeTimesheetStatus } = require('./timesheet-status');
 const { getCredentials } = require('./credentials');
 const { COMMON_CODES } = require('./charge-codes');
+const { normalizeWorkLocation } = require('./add-options');
+const numberPick = require('./number-pick');
+const { writePrivateFile } = require('./private-file');
+const { periodLabel, stepPeriod, currentWeekStart } = require('./tui-nav');
+const { launchForPeriod, createSessionManager, createRevisionHold, listFavorites } = require('./session');
 
 require('dotenv').config();
 
@@ -20,75 +24,46 @@ if (!creds) {
   process.exit(1);
 }
 
-const { url, username, password, system, useDirect } = creds;
-
 // ─── Session management ────────────────────────────────────────
 
-let activeClient = null;
-let clientIdleTimer = null;
-const CLIENT_IDLE_TIMEOUT = 5 * 60 * 1000;
-
-async function launchNewClient() {
-  if (useDirect) return DirectClient.launch(url, username, password);
-  return Costpoint.launch(url, username, password, system);
-}
-
-async function getClient() {
-  if (clientIdleTimer) clearTimeout(clientIdleTimer);
-  if (!activeClient) {
+// One session at a time, bound to a period (0 = active week, N = N weeks
+// back). Asking for another period relaunches it.
+const session = createSessionManager({
+  launch: period => launchForPeriod(creds, period, { preloadPrevious: true }),
+  onLaunch: () => {
     setStatus('Logging in...');
     render();
-    activeClient = await launchNewClient();
-  }
-  clientIdleTimer = setTimeout(releaseClient, CLIENT_IDLE_TIMEOUT);
-  return activeClient;
-}
-
-async function releaseClient() {
-  if (clientIdleTimer) { clearTimeout(clientIdleTimer); clientIdleTimer = null; }
-  if (activeClient) {
-    try { await activeClient.close(); } catch (e) { /* ignore */ }
-    activeClient = null;
-  }
-}
-
-function isSessionError(e) {
-  const msg = (e.message || '').toLowerCase();
-  return msg.includes('session') || msg.includes('not valid') ||
-         msg.includes('econnreset') || msg.includes('econnrefused') ||
-         msg.includes('socket hang up') || msg.includes('onservletexception');
-}
-
-async function withClient(fn) {
-  try {
-    return await fn(await getClient());
-  } catch (e) {
-    if (isSessionError(e)) {
-      setStatus('Session expired, re-logging in...');
-      render();
-      await releaseClient();
-      return await fn(await getClient());
-    }
-    throw e;
-  }
-}
+  },
+  onRetry: () => {
+    setStatus('Session expired, re-logging in...');
+    render();
+  },
+});
+const { getClient, withClient, releaseClient } = session;
 
 // ─── Cache (shared with web UI) ────────────────────────────────
 
 const CACHE_FILE = path.join(os.homedir(), '.costpoint-cache.json');
 let cachedWeeks = {};
 let activeWeekStart = null;
+// Set while the shown data comes from the cache file, until a fetch works
+let cacheStale = false;
 
 function weekStartKey(weekData) {
   if (!weekData || !weekData.dates || weekData.dates.length === 0) return null;
   return weekData.dates[0].fullDate;
 }
 
-function storeWeekData(weekData) {
+// Store fetched week data into the cache without changing the active week
+function cacheWeek(weekData) {
   const key = weekStartKey(weekData);
-  if (!key) return;
-  cachedWeeks[key] = weekData;
-  activeWeekStart = key;
+  if (key) cachedWeeks[key] = weekData;
+  return key;
+}
+
+function storeWeekData(weekData) {
+  const key = cacheWeek(weekData);
+  if (key) activeWeekStart = key;
 }
 
 function loadCache() {
@@ -97,35 +72,55 @@ function loadCache() {
       const parsed = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
       if (parsed && parsed.weeks) {
         cachedWeeks = parsed.weeks;
-        activeWeekStart = parsed.activeWeekStart || null;
+        activeWeekStart = currentWeekStart(parsed.activeWeekStart || null, moment().format('YYYY-MM-DD'));
+        cacheStale = true;
         return true;
       }
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    /* ignore */
+  }
   return false;
 }
 
 function saveCache() {
   try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify({ weeks: cachedWeeks, activeWeekStart }, null, 2));
-  } catch (e) { /* ignore */ }
+    writePrivateFile(CACHE_FILE, JSON.stringify({ weeks: cachedWeeks, activeWeekStart }, null, 2));
+  } catch (e) {
+    /* ignore */
+  }
 }
 
 function getActiveWeekData() {
   return activeWeekStart ? cachedWeeks[activeWeekStart] : null;
 }
 
+function getPeriodData(period) {
+  if (!activeWeekStart) return null;
+  return (
+    cachedWeeks[
+      moment(activeWeekStart)
+        .subtract(7 * period, 'days')
+        .format('YYYY-MM-DD')
+    ] || null
+  );
+}
+
 // Project codes that require a comment when hours are entered
 const COMMENT_REQUIRED_CODES = ['A09909.SUSP.OVH'];
-function isCommentRequired(code) { return COMMENT_REQUIRED_CODES.includes(code); }
+function isCommentRequired(code) {
+  return COMMENT_REQUIRED_CODES.includes(code);
+}
 
 // ─── TUI state ─────────────────────────────────────────────────
 
 let data = null;
+let viewPeriod = 0; // 0 = active week, N = N weeks back
+let lastPastPeriod = 1; // week [w] returns to
+let periodCount = null; // loaded periods, from getPeriods()
 let cursorRow = 0;
 let cursorCol = 0;
 let mode = 'navigate'; // navigate | edit | prompt | menu
-let menuItems = null;   // set when mode === 'menu'
 let editBuffer = '';
 let promptLabel = '';
 let promptBuffer = '';
@@ -133,8 +128,12 @@ let promptCallback = null;
 let statusMsg = '';
 let statusTimer = null;
 let pendingChanges = new Map();
-let leaveData = null;     // { balances, details } from getLeaveBalances()
-let showLeave = false;    // toggle: timesheet vs leave view
+let leaveData = null; // { balances, details } from getLeaveBalances()
+let showLeave = false; // toggle: timesheet vs leave view
+let favoriteOverride = false; // [e] in the favorites list: next pick asks pay type and location
+let favoritesData = null; // array of { code, description, payType }
+let showFavorites = false;
+let pickBuffer = ''; // digits typed so far in a numbered list (favorites, add menu)
 let isProcessing = false;
 let spinnerFrame = 0;
 const SPINNER = '\u28fe\u28fd\u28fb\u28bf\u28ff\u28df\u28ef\u28f7';
@@ -144,11 +143,47 @@ function setStatus(msg, duration) {
   if (statusTimer) clearTimeout(statusTimer);
   statusMsg = msg;
   if (duration) {
-    statusTimer = setTimeout(() => { statusMsg = ''; render(); }, duration);
+    statusTimer = setTimeout(() => {
+      statusMsg = '';
+      render();
+    }, duration);
   }
 }
 
 // ─── Data operations ───────────────────────────────────────────
+
+function loadViewData() {
+  data = viewPeriod > 0 ? getPeriodData(viewPeriod) : getActiveWeekData();
+}
+
+// Cache a session's data under the week it belongs to
+function storeClientData(cp) {
+  if (viewPeriod > 0) cacheWeek(cp.getData());
+  else storeWeekData(cp.getData());
+  noteClientPeriods(cp);
+}
+
+function noteClientPeriods(cp) {
+  const periods = cp.getPeriods();
+  if (periods.length > 0) periodCount = periods.length;
+}
+
+// Editing a processed previous week reopens it, and it must be signed again
+function savedStatus(msg) {
+  if (viewPeriod > 0 && data && normalizeTimesheetStatus(data.timesheetStatusCode).tone === 'open') {
+    setStatus(chalk.green(msg) + '  ' + chalk.yellow('This week is Open. Press [S] to sign.'), 8000);
+  } else {
+    setStatus(chalk.green(msg), 3000);
+  }
+}
+
+// Blocks active-week-only actions while a past week is shown
+function requireActiveWeek(action) {
+  if (viewPeriod === 0) return true;
+  setStatus(chalk.yellow(action + ' is only available on the active week ([w] to switch).'), 3000);
+  render();
+  return false;
+}
 
 async function fetchData() {
   if (isProcessing) return;
@@ -161,29 +196,36 @@ async function fetchData() {
     await releaseClient();
     const cp = await getClient();
     storeWeekData(cp.getData());
+    noteClientPeriods(cp);
 
     try {
-      if (typeof cp.getPreviousPeriodData === 'function') {
-        const other = cp.getPreviousPeriodData();
-        if (other) {
-          const key = weekStartKey(other);
-          if (key) cachedWeeks[key] = other;
-        }
-      }
-    } catch (e) { /* non-fatal */ }
+      const other = cp.getPreviousPeriodData();
+      if (other) cacheWeek(other);
+    } catch (e) {
+      /* non-fatal */
+    }
 
+    cacheStale = false;
     saveCache();
-    data = getActiveWeekData();
+    loadViewData();
     clampCursor();
     setStatus(chalk.green('Loaded.'), 3000);
   } catch (e) {
-    setStatus(chalk.red('Load failed: ' + e.message), 5000);
+    // Stays up while the cached view is all there is
+    setStatus(
+      chalk.red('Load failed: ' + e.message + (cacheStale ? '  Showing cached data; [r] to retry.' : '')),
+      cacheStale ? 0 : 5000
+    );
   } finally {
     isProcessing = false;
     stopSpinner();
     render();
   }
 }
+
+// The week whose save waits on a revision explanation. Only the explanation
+// prompt reads it; Esc leaves it set and the next save that asks replaces it.
+const revisionHold = createRevisionHold();
 
 async function doSave() {
   if (isProcessing || pendingChanges.size === 0) {
@@ -197,30 +239,31 @@ async function doSave() {
   render();
 
   const changes = Array.from(pendingChanges.values());
+  const period = viewPeriod;
   try {
-    await withClient(async (cp) => {
-      if (changes.length === 1) {
-        await cp.set(changes[0].line, changes[0].day, changes[0].hours, changes[0].comment);
-      } else {
-        await cp.setm(changes);
-      }
+    await withClient(async cp => {
+      await cp.setm(changes);
       await cp.save();
-      storeWeekData(cp.getData());
+      storeClientData(cp);
       saveCache();
-    });
-    data = getActiveWeekData();
+    }, period);
+    loadViewData();
     pendingChanges.clear();
     clampCursor();
-    setStatus(chalk.green('Saved ' + changes.length + ' change' + (changes.length !== 1 ? 's' : '') + '.'), 3000);
+    savedStatus('Saved ' + changes.length + ' change' + (changes.length !== 1 ? 's' : '') + '.');
   } catch (e) {
-    if (e.name === 'RevisionRequiredError') {
+    if (revisionHold.hold(e, period)) {
       stopSpinner();
       isProcessing = false;
-      const details = e.auditDetails.map(d => d.description).filter(Boolean).join('; ');
+      const details = e.auditDetails
+        .map(d => d.description)
+        .filter(Boolean)
+        .join('; ');
       setStatus(chalk.yellow('Revision required: ' + (details || 'changes need explanation')), 0);
       render();
-      enterPrompt('Explanation: ', async (explanation) => {
+      enterPrompt('Explanation: ', async explanation => {
         if (!explanation || !explanation.trim()) {
+          revisionHold.clear();
           setStatus(chalk.red('Save cancelled — explanation required.'), 3000);
           render();
           return;
@@ -230,15 +273,17 @@ async function doSave() {
         setStatus('Saving with explanation...');
         render();
         try {
-          await withClient(async (cp) => {
-            await cp.saveWithExplanation(explanation.trim());
-            storeWeekData(cp.getData());
-            saveCache();
-          });
-          data = getActiveWeekData();
+          await revisionHold.finish(held =>
+            withClient(async cp => {
+              await cp.saveWithExplanation(explanation.trim());
+              storeClientData(cp);
+              saveCache();
+            }, held)
+          );
+          loadViewData();
           pendingChanges.clear();
           clampCursor();
-          setStatus(chalk.green('Saved with revision explanation.'), 3000);
+          savedStatus('Saved with revision explanation.');
         } catch (e2) {
           setStatus(chalk.red('Save failed: ' + e2.message), 5000);
         } finally {
@@ -267,14 +312,15 @@ async function doSign() {
   try {
     // Sign on a fresh dedicated session. Signing on a session that has been
     // through the init/edit flow is silently ignored by the server — same
-    // workaround as signTimesheet() in server.js.
+    // workaround as signTimesheet() in server.js. getClient() launches the
+    // previous week fresh and selects it before anything else runs.
     await releaseClient();
-    await withClient(async (cp) => {
+    await withClient(async cp => {
       await cp.sign();
-      storeWeekData(cp.getData());
+      storeClientData(cp);
       saveCache();
-    });
-    data = getActiveWeekData();
+    }, viewPeriod);
+    loadViewData();
     pendingChanges.clear();
     setStatus(chalk.green('Timesheet signed.'), 3000);
   } catch (e) {
@@ -286,7 +332,17 @@ async function doSign() {
   }
 }
 
-async function doAddProject(code, payType) {
+function doAddProject(code, payType, favorite = false, workLocation) {
+  return runAdd(code, cp => cp.add(code, payType || 'REG', { workLocation }), favorite);
+}
+
+// A pick from [f]: the favorite is looked up again on the session that adds
+// it, like te add and add_from_favorites (tecli-a1t.12)
+function doAddFavorite(index, fav, { payType, workLocation } = {}) {
+  return runAdd(fav.code, cp => cp.addFromFavorite(index, { payType, workLocation }));
+}
+
+async function runAdd(code, add, favorite = false) {
   if (isProcessing) return;
   isProcessing = true;
   startSpinner();
@@ -294,15 +350,27 @@ async function doAddProject(code, payType) {
   render();
 
   try {
-    await withClient(async (cp) => {
-      await cp.add(code, payType || 'REG');
+    let favoriteError = null;
+    await withClient(async cp => {
+      await add(cp);
+      if (favorite) {
+        try {
+          await cp.addToFavorites();
+        } catch (e) {
+          favoriteError = e.message;
+        }
+      }
       await cp.save();
-      storeWeekData(cp.getData());
+      storeClientData(cp);
       saveCache();
-    });
-    data = getActiveWeekData();
+    }, viewPeriod);
+    loadViewData();
     clampCursor();
-    setStatus(chalk.green('Added ' + code + '.'), 3000);
+    if (favoriteError) {
+      setStatus(chalk.yellow('Added ' + code + '. Could not add to favorites: ' + favoriteError), 5000);
+    } else {
+      setStatus(chalk.green('Added ' + code + (favorite ? ' and saved to favorites.' : '.')), 3000);
+    }
   } catch (e) {
     setStatus(chalk.red('Add failed: ' + e.message), 5000);
   } finally {
@@ -314,7 +382,8 @@ async function doAddProject(code, payType) {
 
 function doCopyThuFri() {
   if (!data || !data.dates) return;
-  let thuIdx = -1, friIdx = -1;
+  let thuIdx = -1,
+    friIdx = -1;
   for (let i = 0; i < data.dates.length; i++) {
     if (data.dates[i].dayOfWeek === 'Thu') thuIdx = i;
     if (data.dates[i].dayOfWeek === 'Fri') friIdx = i;
@@ -362,6 +431,27 @@ async function doLeaveBalances() {
   }
 }
 
+async function doFavorites() {
+  if (isProcessing) return;
+  isProcessing = true;
+  startSpinner();
+  setStatus('Loading favorites...');
+  render();
+
+  try {
+    favoritesData = await listFavorites(creds);
+    showFavorites = true;
+    pickBuffer = '';
+    setStatus(chalk.green('Favorites loaded.'), 3000);
+  } catch (e) {
+    setStatus(chalk.red('Favorites failed: ' + e.message), 5000);
+  } finally {
+    isProcessing = false;
+    stopSpinner();
+    render();
+  }
+}
+
 // ─── Helpers ───────────────────────────────────────────────────
 
 function getCellValue(row, col) {
@@ -372,7 +462,7 @@ function getCellValue(row, col) {
 
   if (pendingChanges.has(key)) {
     const h = pendingChanges.get(key).hours;
-    return (h === 0 || h === '') ? '' : String(h);
+    return h === 0 || h === '' ? '' : String(h);
   }
 
   const hours = project.hours[day];
@@ -395,7 +485,11 @@ function getCellComment(row, col) {
 }
 
 function clampCursor() {
-  if (!data || !data.projects || data.projects.length === 0) { cursorRow = 0; cursorCol = 0; return; }
+  if (!data || !data.projects || data.projects.length === 0) {
+    cursorRow = 0;
+    cursorCol = 0;
+    return;
+  }
   cursorRow = Math.min(cursorRow, data.projects.length - 1);
   cursorCol = Math.min(cursorCol, data.dates.length - 1);
 }
@@ -403,11 +497,17 @@ function clampCursor() {
 function startSpinner() {
   spinnerFrame = 0;
   if (spinnerInterval) clearInterval(spinnerInterval);
-  spinnerInterval = setInterval(() => { spinnerFrame = (spinnerFrame + 1) % SPINNER.length; render(); }, 100);
+  spinnerInterval = setInterval(() => {
+    spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+    render();
+  }, 100);
 }
 
 function stopSpinner() {
-  if (spinnerInterval) { clearInterval(spinnerInterval); spinnerInterval = null; }
+  if (spinnerInterval) {
+    clearInterval(spinnerInterval);
+    spinnerInterval = null;
+  }
 }
 
 // ─── Rendering ─────────────────────────────────────────────────
@@ -418,26 +518,36 @@ function render() {
   const lines = [];
 
   // ── Header ──
-  const title = chalk.bold('Str8 Outta Deltek');
+  const title =
+    chalk.bold('Str8 Outta Deltek') + (viewPeriod > 0 ? ' ' + chalk.magenta.bold(periodLabel(viewPeriod)) : '');
   let badges = '';
   if (data) {
     const meta = normalizeTimesheetStatus(data.timesheetStatusCode || data.timesheetStatus);
     const colors = {
-      open: chalk.blue, signed: chalk.yellow, approved: chalk.green,
-      rejected: chalk.red, processed: chalk.gray, missing: chalk.yellow, unknown: chalk.gray,
+      open: chalk.blue,
+      signed: chalk.yellow,
+      approved: chalk.green,
+      rejected: chalk.red,
+      processed: chalk.gray,
+      missing: chalk.yellow,
+      unknown: chalk.gray,
     };
     badges += (colors[meta.tone] || chalk.gray)('[' + meta.label + ']');
   }
+  if (cacheStale) badges += ' ' + chalk.red('[CACHED]');
   if (pendingChanges.size > 0) badges += ' ' + chalk.yellow(pendingChanges.size + ' unsaved');
   if (isProcessing) badges += ' ' + chalk.yellow(SPINNER[spinnerFrame]);
-  badges += activeClient ? ' ' + chalk.green('\u25cf') : ' ' + chalk.gray('\u25cb');
+  badges += session.current() ? ' ' + chalk.green('\u25cf') : ' ' + chalk.gray('\u25cb');
 
   const gap = Math.max(1, W - strip(title).length - strip(badges).length);
   lines.push(title + ' '.repeat(gap) + badges);
 
   if (data && data.dates) {
-    const s = data.dates[0], e = data.dates[data.dates.length - 1];
-    let periodLine = chalk.dim('Period: ' + s.dayOfWeek + ' ' + s.fullDate + ' \u2014 ' + e.dayOfWeek + ' ' + e.fullDate);
+    const s = data.dates[0],
+      e = data.dates[data.dates.length - 1];
+    let periodLine = chalk.dim(
+      'Period: ' + s.dayOfWeek + ' ' + s.fullDate + ' \u2014 ' + e.dayOfWeek + ' ' + e.fullDate
+    );
     // Show comment for current cell if any
     if (data.projects && data.projects.length > 0 && !showLeave && mode !== 'prompt') {
       const curComment = getCellComment(cursorRow, cursorCol);
@@ -474,12 +584,37 @@ function render() {
       lines.push(chalk.bold('Recent Activity'));
       lines.push('');
       lines.push(chalk.dim('  ' + rpad('Date', 12) + rpad('Type', 10) + lpad('Hours', 8) + '  ' + 'Leave Type'));
-      lines.push(chalk.dim('  ' + '\u2500'.repeat(12) + '\u2500'.repeat(10) + '\u2500'.repeat(8) + '  ' + '\u2500'.repeat(20)));
+      lines.push(
+        chalk.dim('  ' + '\u2500'.repeat(12) + '\u2500'.repeat(10) + '\u2500'.repeat(8) + '  ' + '\u2500'.repeat(20))
+      );
       for (const d of leaveData.details) {
         const hrs = d.hours.toFixed(2);
         const color = d.hours > 0 ? chalk.green : d.hours < 0 ? chalk.red : chalk.dim;
-        lines.push('  ' + rpad(d.date, 12) + rpad(d.type, 10) + color(lpad(hrs, 8)) + '  ' + (d.leaveTypeDesc || d.leaveTypeCode));
+        lines.push(
+          '  ' + rpad(d.date, 12) + rpad(d.type, 10) + color(lpad(hrs, 8)) + '  ' + (d.leaveTypeDesc || d.leaveTypeCode)
+        );
       }
+    }
+  } else if (showFavorites && favoritesData) {
+    // ── Favorites view ──
+    lines.push(chalk.bold('Favorites'));
+    lines.push('');
+
+    if (favoritesData.length === 0) {
+      lines.push(chalk.dim('  No favorites found. Add them in the Costpoint web UI.'));
+    } else {
+      const codeW = favoritesData.reduce((m, f) => Math.max(m, (f.code || '').length), 4);
+      lines.push(chalk.dim('  ' + rpad('#', 3) + rpad('Code', codeW + 2) + rpad('Pay', 5) + 'Description'));
+      lines.push(chalk.dim('  ' + '─'.repeat(3) + '─'.repeat(codeW + 2) + '─'.repeat(5) + '─'.repeat(30)));
+      favoritesData.forEach((f, i) => {
+        lines.push(
+          '  ' +
+            chalk.yellow(rpad(String(i + 1), 3)) +
+            rpad(f.code || '', codeW + 2) +
+            rpad(f.payType || '', 5) +
+            chalk.dim(f.description || '')
+        );
+      });
     }
   } else if (data && data.projects && data.dates) {
     // ── Timesheet table ──
@@ -491,16 +626,33 @@ function render() {
     const descW = Math.min(30, Math.max(8, avail - codeW));
 
     // Header
-    lines.push(chalk.dim(
-      rpad('#', 2) + '  ' + rpad('Code', codeW) + '  ' + rpad('Description', descW) + '  ' +
-      rpad('Pay', 3) + ' ' + data.dates.map(d => lpad(d.dayOfWeek.slice(0, 3), 4)).join(' ') +
-      ' ' + lpad('Total', 5)
-    ));
-    lines.push(chalk.dim(
-      '\u2500\u2500  ' + '\u2500'.repeat(codeW) + '  ' + '\u2500'.repeat(descW) + '  ' +
-      '\u2500\u2500\u2500 ' + data.dates.map(() => '\u2500\u2500\u2500\u2500').join(' ') +
-      ' \u2500\u2500\u2500\u2500\u2500'
-    ));
+    lines.push(
+      chalk.dim(
+        rpad('#', 2) +
+          '  ' +
+          rpad('Code', codeW) +
+          '  ' +
+          rpad('Description', descW) +
+          '  ' +
+          rpad('Pay', 3) +
+          ' ' +
+          data.dates.map(d => lpad(d.dayOfWeek.slice(0, 3), 4)).join(' ') +
+          ' ' +
+          lpad('Total', 5)
+      )
+    );
+    lines.push(
+      chalk.dim(
+        '\u2500\u2500  ' +
+          '\u2500'.repeat(codeW) +
+          '  ' +
+          '\u2500'.repeat(descW) +
+          '  ' +
+          '\u2500\u2500\u2500 ' +
+          data.dates.map(() => '\u2500\u2500\u2500\u2500').join(' ') +
+          ' \u2500\u2500\u2500\u2500\u2500'
+      )
+    );
 
     // Rows
     for (let r = 0; r < data.projects.length; r++) {
@@ -532,21 +684,33 @@ function render() {
 
       const codeStr = rpad(trunc(p.code || '', codeW), codeW);
       lines.push(
-        lpad(String(r), 2) + '  ' +
-        (isCommentRequired(p.code) ? chalk.cyan(codeStr) : codeStr) + '  ' +
-        rpad(trunc(p.description || '', descW), descW) + '  ' +
-        rpad(p.payType || '', 3) + ' ' +
-        cells.join(' ') + ' ' +
-        lpad(rowTotal ? String(rowTotal) : '', 5)
+        lpad(String(r), 2) +
+          '  ' +
+          (isCommentRequired(p.code) ? chalk.cyan(codeStr) : codeStr) +
+          '  ' +
+          rpad(trunc(p.description || '', descW), descW) +
+          '  ' +
+          rpad(p.payType || '', 3) +
+          ' ' +
+          cells.join(' ') +
+          ' ' +
+          lpad(rowTotal ? String(rowTotal) : '', 5)
       );
     }
 
     // Separator + totals
-    lines.push(chalk.dim(
-      '\u2500\u2500  ' + '\u2500'.repeat(codeW) + '  ' + '\u2500'.repeat(descW) + '  ' +
-      '\u2500\u2500\u2500 ' + data.dates.map(() => '\u2500\u2500\u2500\u2500').join(' ') +
-      ' \u2500\u2500\u2500\u2500\u2500'
-    ));
+    lines.push(
+      chalk.dim(
+        '\u2500\u2500  ' +
+          '\u2500'.repeat(codeW) +
+          '  ' +
+          '\u2500'.repeat(descW) +
+          '  ' +
+          '\u2500\u2500\u2500 ' +
+          data.dates.map(() => '\u2500\u2500\u2500\u2500').join(' ') +
+          ' \u2500\u2500\u2500\u2500\u2500'
+      )
+    );
 
     let grand = 0;
     const dailies = data.dates.map((d, c) => {
@@ -557,8 +721,16 @@ function render() {
     });
 
     lines.push(
-      '    ' + rpad('', codeW) + '  ' + rpad(chalk.bold('Daily Total'), descW) + '  ' +
-      rpad('', 3) + ' ' + dailies.join(' ') + ' ' + chalk.bold(lpad(grand ? String(grand) : '0', 5))
+      '    ' +
+        rpad('', codeW) +
+        '  ' +
+        rpad(chalk.bold('Daily Total'), descW) +
+        '  ' +
+        rpad('', 3) +
+        ' ' +
+        dailies.join(' ') +
+        ' ' +
+        chalk.bold(lpad(grand ? String(grand) : '0', 5))
     );
   }
 
@@ -572,7 +744,11 @@ function render() {
       menuLines.push('  ' + chalk.yellow(String(i + 1)) + '  ' + c.label + chalk.dim(' — ' + c.code) + note);
     }
     menuLines.push('  ' + chalk.yellow('0') + '  Custom code...');
-    menuLines.push(chalk.dim('Press number to select, Esc to cancel'));
+    menuLines.push(
+      pickBuffer
+        ? chalk.cyan('#' + pickBuffer + '\u2588') + chalk.dim('  Enter to select, Backspace to edit, Esc to clear')
+        : chalk.dim('Press number to select, Esc to cancel')
+    );
     const footerHeight = menuLines.length + 1; // +1 for status line
     while (lines.length < H - footerHeight) lines.push('');
     lines.push(...menuLines);
@@ -584,28 +760,67 @@ function render() {
     } else {
       if (showLeave) {
         lines.push(chalk.dim('[l]eave back  [r]efresh  [q]uit'));
+      } else if (showFavorites) {
+        lines.push(
+          pickBuffer
+            ? chalk.cyan('Favorite #' + pickBuffer + '\u2588') +
+                chalk.dim('  Enter to add, Backspace to edit, Esc to clear')
+            : chalk.dim(
+                '[1-' +
+                  (favoritesData && favoritesData.length > 0 ? favoritesData.length : 'N') +
+                  '] add  [e]dit options' +
+                  (favoriteOverride ? ' (on)' : '') +
+                  '  [f]avorites back  [q]uit'
+              )
+        );
+      } else if (viewPeriod > 0) {
+        lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [w]eek  < >  [l]eave  [f]av  [q]uit'));
       } else {
-        lines.push(chalk.dim('[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [c]opy Thu\u2192Fri  [l]eave  [q]uit'));
+        lines.push(
+          chalk.dim(
+            '[s]ave  [S]ign  [r]efresh  [a]dd  [C]omment  [c]opy Thu\u2192Fri  [w]eek  < >  [l]eave  [f]av  [q]uit'
+          )
+        );
       }
     }
   }
-  lines.push(statusMsg || chalk.dim('Ready' + (activeClient ? ' \u2022 session active' : '')));
+  lines.push(statusMsg || chalk.dim('Ready' + (session.current() ? ' \u2022 session active' : '')));
 
   // ── Write ──
-  process.stdout.write('\x1b[H' + lines.slice(0, H).map(l => l + '\x1b[K').join('\n') + '\x1b[J');
+  process.stdout.write(
+    '\x1b[H' +
+      lines
+        .slice(0, H)
+        .map(l => l + '\x1b[K')
+        .join('\n') +
+      '\x1b[J'
+  );
 }
 
 // String helpers
-function strip(s) { return s.replace(/\x1b\[[0-9;]*m/g, ''); }
-function lpad(s, w) { const l = strip(String(s)).length; return l >= w ? String(s) : ' '.repeat(w - l) + s; }
-function rpad(s, w) { const l = strip(String(s)).length; return l >= w ? String(s) : s + ' '.repeat(w - l); }
-function trunc(s, w) { return s.length > w ? s.substring(0, w - 2) + '..' : s; }
+function strip(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, '');
+}
+function lpad(s, w) {
+  const l = strip(String(s)).length;
+  return l >= w ? String(s) : ' '.repeat(w - l) + s;
+}
+function rpad(s, w) {
+  const l = strip(String(s)).length;
+  return l >= w ? String(s) : s + ' '.repeat(w - l);
+}
+function trunc(s, w) {
+  return s.length > w ? s.substring(0, w - 2) + '..' : s;
+}
 
 // ─── Input handling ────────────────────────────────────────────
 
 function handleKeypress(str, key) {
   if (!key) return;
-  if (key.ctrl && key.name === 'c') { shutdown(); return; }
+  if (key.ctrl && key.name === 'c') {
+    shutdown();
+    return;
+  }
   if (isProcessing) return;
 
   if (mode === 'menu') return handleMenuKey(str, key);
@@ -616,15 +831,82 @@ function handleKeypress(str, key) {
 
 function handleNavigateKey(str, key) {
   if (showLeave) {
-    if (str === 'l' || key.name === 'escape') { showLeave = false; render(); return; }
-    if (str === 'r') { doLeaveBalances(); return; }
-    if (str === 'q') { shutdown(); return; }
+    if (str === 'l' || key.name === 'escape') {
+      showLeave = false;
+      render();
+      return;
+    }
+    if (str === 'r') {
+      doLeaveBalances();
+      return;
+    }
+    if (str === 'q') {
+      shutdown();
+      return;
+    }
+    return;
+  }
+
+  if (showFavorites) {
+    const count = favoritesData ? favoritesData.length : 0;
+    if (
+      handlePickKey(str, key, count, n => {
+        showFavorites = false;
+        const fav = favoritesData[n - 1];
+        if (favoriteOverride) {
+          favoriteOverride = false;
+          enterPrompt('Pay type [' + (fav.payType || 'Costpoint default') + ']: ', function (pt) {
+            promptWorkLocation(function (loc) {
+              doAddFavorite(n - 1, fav, { payType: pt.trim().toUpperCase(), workLocation: loc });
+            });
+          });
+          return;
+        }
+        doAddFavorite(n - 1, fav);
+      })
+    )
+      return;
+    if (str === 'e') {
+      favoriteOverride = !favoriteOverride;
+      setStatus(favoriteOverride ? 'Next pick asks pay type and work location.' : 'Override off.', 2000);
+      render();
+      return;
+    }
+    if (str === 'f' || key.name === 'escape') {
+      showFavorites = false;
+      favoriteOverride = false;
+      render();
+      return;
+    }
+    if (str === 'q') {
+      shutdown();
+      return;
+    }
+    return;
+  }
+
+  if (str === 'w') {
+    toggleWeek();
+    return;
+  }
+  if (str === '<') {
+    stepWeek(1);
+    return;
+  }
+  if (str === '>') {
+    stepWeek(-1);
     return;
   }
 
   if (!data || !data.projects || data.projects.length === 0) {
-    if (str === 'r') { fetchData(); return; }
-    if (str === 'q') { shutdown(); return; }
+    if (str === 'r') {
+      fetchData();
+      return;
+    }
+    if (str === 'q') {
+      shutdown();
+      return;
+    }
     return;
   }
 
@@ -632,39 +914,61 @@ function handleNavigateKey(str, key) {
   const maxC = data.dates.length - 1;
 
   switch (key.name) {
-    case 'up':    cursorRow = Math.max(0, cursorRow - 1); break;
-    case 'down':  cursorRow = Math.min(maxR, cursorRow + 1); break;
-    case 'left':  cursorCol = Math.max(0, cursorCol - 1); break;
-    case 'right': cursorCol = Math.min(maxC, cursorCol + 1); break;
+    case 'up':
+      cursorRow = Math.max(0, cursorRow - 1);
+      break;
+    case 'down':
+      cursorRow = Math.min(maxR, cursorRow + 1);
+      break;
+    case 'left':
+      cursorCol = Math.max(0, cursorCol - 1);
+      break;
+    case 'right':
+      cursorCol = Math.min(maxC, cursorCol + 1);
+      break;
     case 'tab':
       if (key.shift) {
-        if (--cursorCol < 0) { cursorCol = maxC; cursorRow = Math.max(0, cursorRow - 1); }
+        if (--cursorCol < 0) {
+          cursorCol = maxC;
+          cursorRow = Math.max(0, cursorRow - 1);
+        }
       } else {
-        if (++cursorCol > maxC) { cursorCol = 0; cursorRow = Math.min(maxR, cursorRow + 1); }
+        if (++cursorCol > maxC) {
+          cursorCol = 0;
+          cursorRow = Math.min(maxR, cursorRow + 1);
+        }
       }
       break;
     case 'return':
+      if (!canEditView()) return;
       mode = 'edit';
       editBuffer = getCellValue(cursorRow, cursorCol);
       break;
     case 'backspace':
     case 'delete':
+      if (!canEditView()) return;
       commitEdit('');
       break;
     default:
-      if (str === 's' && !key.shift) { doSave(); return; }
+      if (str === 's' && !key.shift) {
+        doSave();
+        return;
+      }
       if (str === 'S' || (str === 's' && key.shift)) {
         if (pendingChanges.size > 0) {
           setStatus(chalk.yellow('Save changes before signing.'), 3000);
           render();
           return;
         }
-        enterPrompt('Sign timesheet? [y/n] ', function(ans) {
+        enterPrompt((viewPeriod > 0 ? 'Sign this past week?' : 'Sign timesheet?') + ' [y/n] ', function (ans) {
           if (ans.toLowerCase() === 'y') doSign();
         });
         return;
       }
-      if (str === 'r') { fetchData(); return; }
+      if (str === 'r') {
+        fetchData();
+        return;
+      }
       if (str === 'a') {
         enterMenu();
         return;
@@ -672,22 +976,39 @@ function handleNavigateKey(str, key) {
       if (str === 'C' || (str === 'c' && key.shift)) {
         // Edit comment on current cell
         if (!data || !data.projects || data.projects.length === 0) return;
+        if (!canEditView()) return;
         const currentComment = getCellComment(cursorRow, cursorCol);
-        enterPrompt('Comment' + (currentComment ? ' [' + currentComment + ']' : '') + ': ', function(text) {
+        enterPrompt('Comment' + (currentComment ? ' [' + currentComment + ']' : '') + ': ', function (text) {
           commitComment(text);
           render();
         });
         return;
       }
-      if (str === 'c' && !key.shift) { doCopyThuFri(); return; }
+      if (str === 'c' && !key.shift) {
+        if (requireActiveWeek('Copy Thu\u2192Fri')) doCopyThuFri();
+        return;
+      }
       if (str === 'l') {
-        if (showLeave) { showLeave = false; render(); }
-        else { doLeaveBalances(); }
+        if (showLeave) {
+          showLeave = false;
+          render();
+        } else {
+          doLeaveBalances();
+        }
+        return;
+      }
+      if (str === 'f') {
+        if (showFavorites) {
+          showFavorites = false;
+          render();
+        } else {
+          doFavorites();
+        }
         return;
       }
       if (str === 'q') {
         if (pendingChanges.size > 0) {
-          enterPrompt('Unsaved changes. Quit? [y/n] ', function(ans) {
+          enterPrompt('Unsaved changes. Quit? [y/n] ', function (ans) {
             if (ans.toLowerCase() === 'y') shutdown();
           });
           return;
@@ -696,6 +1017,7 @@ function handleNavigateKey(str, key) {
         return;
       }
       if (str && /^[0-9.]$/.test(str)) {
+        if (!canEditView()) return;
         mode = 'edit';
         editBuffer = str;
         render();
@@ -704,6 +1026,75 @@ function handleNavigateKey(str, key) {
       break;
   }
   render();
+}
+
+function goToPeriod(target) {
+  if (pendingChanges.size > 0) {
+    setStatus(chalk.yellow('Save your changes before switching weeks.'), 3000);
+    render();
+    return;
+  }
+  if (target === viewPeriod) return;
+  if (target > 0) lastPastPeriod = target;
+  if (target === 0 || getPeriodData(target)) {
+    showPeriod(target);
+    return;
+  }
+  loadPeriod(target);
+}
+
+function showPeriod(target) {
+  viewPeriod = target;
+  loadViewData();
+  cursorRow = 0;
+  clampCursor();
+  setStatus(target === 0 ? 'Showing the active week.' : 'Showing ' + periodLabel(target).toLowerCase() + '.', 2000);
+  render();
+}
+
+async function loadPeriod(target) {
+  isProcessing = true;
+  startSpinner();
+  setStatus('Loading ' + periodLabel(target).toLowerCase() + '...');
+  render();
+  try {
+    await withClient(async cp => {
+      cacheWeek(cp.getData());
+      noteClientPeriods(cp);
+      saveCache();
+    }, target);
+    isProcessing = false;
+    showPeriod(target);
+  } catch (e) {
+    setStatus(chalk.red('Load failed: ' + e.message), 5000);
+  } finally {
+    isProcessing = false;
+    stopSpinner();
+    render();
+  }
+}
+
+function stepWeek(delta) {
+  const target = stepPeriod(viewPeriod, delta, periodCount);
+  if (target === null) {
+    setStatus(chalk.yellow(delta > 0 ? 'No older weeks are loaded.' : 'Already on the active week.'), 2000);
+    render();
+    return;
+  }
+  goToPeriod(target);
+}
+
+function toggleWeek() {
+  goToPeriod(viewPeriod === 0 ? stepPeriod(0, lastPastPeriod, periodCount) || 1 : 0);
+}
+
+function canEditView() {
+  if (data && data.editable === false) {
+    setStatus(chalk.yellow('This week is closed and cannot be corrected.'), 3000);
+    render();
+    return false;
+  }
+  return true;
 }
 
 function handleEditKey(str, key) {
@@ -720,10 +1111,11 @@ function handleEditKey(str, key) {
         const proj = data.projects[editedRow];
         if (isCommentRequired(proj.code) && !getCellComment(editedRow, editedCol)) {
           render();
-          enterPrompt('Comment (required for ' + proj.code + '): ', function(text) {
+          enterPrompt('Comment (required for ' + proj.code + '): ', function (text) {
             if (text) {
               // Temporarily set cursor back to apply comment to correct cell
-              const savedRow = cursorRow, savedCol = cursorCol;
+              const savedRow = cursorRow,
+                savedCol = cursorCol;
               cursorRow = editedRow;
               cursorCol = editedCol;
               commitComment(text);
@@ -759,7 +1151,7 @@ function commitEdit(value) {
   const hours = value === '' ? 0 : parseFloat(value);
 
   const orig = project.hours[day];
-  const origStr = (orig === null || orig === undefined || orig === '') ? '' : String(orig).replace(/\*$/, '');
+  const origStr = orig === null || orig === undefined || orig === '' ? '' : String(orig).replace(/\*$/, '');
   const newStr = value === '' ? '' : String(hours);
 
   if (newStr === origStr || (origStr === '' && hours === 0)) {
@@ -792,40 +1184,92 @@ function commitComment(text) {
   }
 }
 
+/**
+ * Digit entry for a numbered list. Returns true when the key was consumed.
+ * Esc and Backspace act on the typed number first, so Esc only leaves the
+ * list once nothing is pending.
+ */
+function handlePickKey(str, key, count, onPick) {
+  if (pickBuffer && key.name === 'escape') {
+    pickBuffer = '';
+    render();
+    return true;
+  }
+  if (pickBuffer && key.name === 'backspace') {
+    pickBuffer = pickBuffer.slice(0, -1);
+    render();
+    return true;
+  }
+  if (pickBuffer && key.name === 'return') {
+    const n = numberPick.confirm(pickBuffer, count);
+    pickBuffer = '';
+    if (n) onPick(n);
+    else render();
+    return true;
+  }
+  if (!/^[0-9]$/.test(str || '') || (!pickBuffer && str === '0')) return false;
+  const res = numberPick.addDigit(pickBuffer, str, count);
+  pickBuffer = res.buffer;
+  if (res.pick) {
+    onPick(res.pick);
+    return true;
+  }
+  if (res.invalid) setStatus(chalk.yellow('No entry #' + res.invalid + '.'), 2000);
+  render();
+  return true;
+}
+
 function enterMenu() {
   mode = 'menu';
-  menuItems = COMMON_CODES;
+  pickBuffer = '';
   render();
 }
 
 function handleMenuKey(str, key) {
+  if (
+    handlePickKey(str, key, COMMON_CODES.length, n => {
+      const pick = COMMON_CODES[n - 1];
+      mode = 'navigate';
+      doAddProject(pick.code, pick.payType);
+    })
+  )
+    return;
   if (key.name === 'escape') {
     mode = 'navigate';
-    menuItems = null;
     render();
     return;
   }
   // '0' or 'c' = custom entry
   if (str === '0' || str === 'c') {
     mode = 'navigate';
-    menuItems = null;
-    enterPrompt('Project code: ', function(code) {
+    enterPrompt('Project code: ', function (code) {
       if (!code.trim()) return;
-      enterPrompt('Pay type [REG]: ', function(pt) {
-        doAddProject(code.trim(), pt.trim() || 'REG');
+      enterPrompt('Pay type [REG]: ', function (pt) {
+        promptWorkLocation(function (loc) {
+          enterPrompt('Also add to favorites? [y/N] ', function (ans) {
+            doAddProject(code.trim(), pt.trim() || 'REG', ans.trim().toLowerCase() === 'y', loc);
+          });
+        });
       });
     });
     return;
   }
-  // Digit 1-N selects a common code
-  const n = parseInt(str, 10);
-  if (n >= 1 && n <= COMMON_CODES.length) {
-    const pick = COMMON_CODES[n - 1];
-    mode = 'navigate';
-    menuItems = null;
-    doAddProject(pick.code, pick.payType);
-    return;
-  }
+}
+
+// Blank answer keeps Costpoint's default work location. An invalid zip
+// is reported and the prompt repeats.
+function promptWorkLocation(callback) {
+  enterPrompt('Work location zip [Costpoint default]: ', function (text) {
+    let loc;
+    try {
+      loc = normalizeWorkLocation(text);
+    } catch (e) {
+      setStatus(chalk.red(e.message), 3000);
+      promptWorkLocation(callback);
+      return;
+    }
+    callback(loc);
+  });
 }
 
 function enterPrompt(label, callback) {
@@ -861,7 +1305,10 @@ function handlePromptKey(str, key) {
       render();
       break;
     default:
-      if (str && str.length === 1) { promptBuffer += str; render(); }
+      if (str && str.length === 1) {
+        promptBuffer += str;
+        render();
+      }
       break;
   }
 }
@@ -870,15 +1317,19 @@ function handlePromptKey(str, key) {
 
 async function shutdown() {
   stopSpinner();
-  try { await releaseClient(); } catch (e) { /* ignore */ }
-  process.stdout.write('\x1b[?25h');   // show cursor
+  try {
+    await releaseClient();
+  } catch (e) {
+    /* ignore */
+  }
+  process.stdout.write('\x1b[?25h'); // show cursor
   process.stdout.write('\x1b[?1049l'); // restore screen
   process.exit(0);
 }
 
 function main() {
   process.stdout.write('\x1b[?1049h'); // alternate screen
-  process.stdout.write('\x1b[?25l');   // hide cursor
+  process.stdout.write('\x1b[?25l'); // hide cursor
 
   process.stdin.setRawMode(true);
   process.stdin.resume();
@@ -890,7 +1341,7 @@ function main() {
   process.on('SIGTERM', shutdown);
 
   loadCache();
-  data = getActiveWeekData();
+  loadViewData();
   render();
   fetchData();
 }

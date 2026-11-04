@@ -1,18 +1,18 @@
-"use strict";
+'use strict';
 
 const STATUS_CODE_TO_META = {
-  A: { label: "Approved", tone: "approved" },
-  M: { label: "Missing", tone: "missing" },
-  O: { label: "Open", tone: "open" },
-  P: { label: "Processed", tone: "processed" },
-  R: { label: "Rejected", tone: "rejected" },
-  S: { label: "Signed", tone: "signed" },
+  A: { label: 'Approved', tone: 'approved' },
+  M: { label: 'Missing', tone: 'missing' },
+  O: { label: 'Open', tone: 'open' },
+  P: { label: 'Processed', tone: 'processed' },
+  R: { label: 'Rejected', tone: 'rejected' },
+  S: { label: 'Signed', tone: 'signed' },
 };
 
 function normalizeTimesheetStatus(rawStatus) {
-  const trimmedStatus = typeof rawStatus === "string" ? rawStatus.trim() : "";
+  const trimmedStatus = typeof rawStatus === 'string' ? rawStatus.trim() : '';
   if (!trimmedStatus) {
-    return { code: "", label: "Unknown", tone: "unknown" };
+    return { code: '', label: 'Unknown', tone: 'unknown' };
   }
 
   const upperStatus = trimmedStatus.toUpperCase();
@@ -32,7 +32,7 @@ function normalizeTimesheetStatus(rawStatus) {
     };
   }
 
-  return { code: trimmedStatus, label: trimmedStatus, tone: "unknown" };
+  return { code: trimmedStatus, label: trimmedStatus, tone: 'unknown' };
 }
 
 module.exports = {

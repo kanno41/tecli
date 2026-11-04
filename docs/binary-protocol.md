@@ -33,6 +33,7 @@ A complete reverse-engineered specification of the Deltek Costpoint web framewor
     - [Revision Explanation](#revision-explanation)
     - [Leave Balances](#leave-balances)
     - [Previous Period Fetch](#previous-period-fetch)
+    - [Previous Period Edit](#previous-period-edit)
 19. [Password Encoding](#password-encoding)
 20. [SSO / SAML Authentication](#sso--saml-authentication)
 21. [Production Gotchas](#production-gotchas)
@@ -208,7 +209,7 @@ ${name}$N\x08{value}P\x07
 |------|---------|
 | rsType | Row set type: M (master), SR (sub-record), L (lookup) |
 | objectId | Field being validated (e.g., UDT02_ID, DAY4_HRS) |
-| actionId | Action name for CMD 300 (TMMTS_NEW_TS_LINE, TC_TS_CHARGE_LKP_OK) |
+| actionId | Action name for CMD 300 (TMMTS_NEW_TS_LINE, TMMTS_ADD_LINE_TO_FAVORITES, TC_TS_CHARGE_LKP_OK) |
 | lastPutId | Incrementing counter per-session, tracks PUT ordering |
 | checkCache | Hash of previous response for cache validation (Java String.hashCode()) |
 | rsContextOnly | "Y" — PUT is context-only, not a data mutation |
@@ -277,7 +278,7 @@ The server response is a JavaScript assignment:
 var responses=[{frame_array}, {rescds_string}, {data_array}, {error_array}];
 ```
 
-This is parsed by `eval`-ing it with stubs for browser globals (`parent`, `D`, `g`) that the server-side JS may reference.
+`parseResponse()` in `protocol.js` reads it as data and never runs it: arrays, `"`/`'` strings, numbers, `null`/`true`/`false` and `new Array(...)`. The `function(g){...}` UI scripts in later slots (OPEN_RS `D.V(g,"maObjId",...)` and the like) come back as their source text; `columnNames()` reads them from the raw body. Any other syntax, or text after the array, fails the parse. Tests: `test/parse-response.test.js`.
 
 ### Response Structure
 
@@ -472,14 +473,24 @@ The parent record set contains timesheet header information. One row per availab
 | 2 | SCHEDULE_DESC | Pay schedule description (contains "Wk N of M") |
 | 3 | END_DT | Period end date (used to compute day columns) |
 | 4 | S_STATUS_CD | Timesheet status code (A/M/O/P/R/S) |
-| 565 | ENABLE_SIGN_FL | Whether signing is enabled for this period |
-| 667 | ACTION_CD | Set to "S" to trigger sign on save |
+| 5 | REVISION_NO | Timesheet revision; a correction bumps it |
+| 23 | ACTION_CD | Set to "S" to trigger sign on save |
+| 34 | CORRECTION_STATE | `NA`, or `INP` while a correction is in progress |
+| 575 | ENABLE_SIGN_FL | Whether signing is enabled for this period |
+| 680 | ENABLE_CORRECT_FL | Whether the Correct action is available |
+| 689 | TS_CLOSED_FL | `Y` on a processed (closed) period; edits need a correction first |
+
+Indices are for the live 692-column layout (2026-10). The captures through `add-favorite/` have 688 columns (573/676/685): Costpoint inserts columns between releases. `direct.js` does not hard-code these: at launch it decodes the K0 `maObjId` name list from the OPEN_RS response (`protocol.columnNames()`) and resolves each column by name (`resolveParentColumns()`). A missing or repeated name, or a name list that does not match the row width, fails the launch. A Processed week whose `TS_CLOSED_FL` is not `Y` refuses to edit.
+
+`maObjId` arrives as `D.V(g,"maObjId","...")` in slot 5 of the OPEN_RS response. Names are separated by `\x0B`; `\x0E{n}` starts a name with the first n chars of the previous one; `\x12{n}` and `\x10{a}{b}` copy a prefix or substring of a source name (the previous one, or k back when the name ends in a small-number k). Numbers use `decodeSmallNumber`.
+
+Only row 0 comes back with its non-DB columns (everything past the first ~45 filled) from a plain `204 K0` fetch. The `R=AUTO` fetch fills rows 1-20 (see [Previous Period Fetch](#previous-period-fetch)).
 
 ---
 
 ## Column Layout — Child (K1, TMMTS_TS_LINE)
 
-Each child row is a timesheet line (one project). The row has **402 columns**.
+Each child row is a timesheet line (one project). The live row has **403 columns** (2026-10); the captures have 402. Costpoint inserted `REVERSED_FROM_LN_NO` at 244, so every column from 244 on moved up by one. Indices below 244 are the same in both. `direct.js` resolves the columns it uses by name (`resolveChildColumns()`) from the K1 `maObjId` list, which arrives with the K1 OPEN_RS in the init parent batch. A missing or repeated name, or a list that does not match the row width, fails the launch. Indices >= 244 below show capture -> live.
 
 ### Key Columns
 
@@ -490,10 +501,10 @@ Each child row is a timesheet line (one project). The row has **402 columns**.
 | 2 | LINE_DESC | Project description |
 | 4 | CHARGE_ID (UDT01_ID) | Charge identifier (e.g., ZTC-DL-000-0000). **Must be kept in PUT data** — clearing causes "Account required" |
 | 6 | UDT02_ID | Project code (e.g., ZLEAVE.CMP) |
-| 8 | UDT03_ID (PLC) | Project Labor Category |
+| 8 | UDT03_ID | Work location (zip code). Server default filled at charge resolution. Change = PUT K1 + CMD 208 `UDT03_ID` (captured/work-location/) |
 | 14 | ACCOUNT | Account (populated by server after charge resolution) |
 | 16 | PAY_TYPE (UDT10_ID) | Pay type (e.g., REG, RHB). **Must NOT be manually set for multi-charge codes** |
-| 17 | WORK_LOCATION | Work location |
+| 17 | WORK_LOCATION | Empty on charge-code lines, `00` on leave lines. Not the zip the UI shows |
 | 96 | TOTAL_ENTERED | Computed total hours for the row |
 | 101 | LEAVE_TYPE1 | Leave type |
 | 105 | PROJECT2 | Secondary project reference |
@@ -527,7 +538,7 @@ Note: Comment columns are NOT sequentially numbered. The mapping was discovered 
 These columns carry employee defaults and must be copied from an existing row when creating a new one:
 
 ```
-0, 150, 151, 187, 193, 194, 197, 234, 235, 336, 398
+0, 150, 151, 187, 193, 194, 197, 234, 235, 336 -> 337 (TS_SCHEDULE_CD), 398 -> 399 (YEAR_NO_CD)
 ```
 
 ### New Row Columns
@@ -537,7 +548,7 @@ These columns carry employee defaults and must be copied from an existing row wh
 | 1 | next seq number | Sequence number |
 | 198 | next seq number | Duplicate seq number |
 | 196 | "N" | New row flag |
-| 393 | "N" | New row flag (duplicate) |
+| 393 -> 394 | "N" | UDT_FROM_LKP_FL |
 
 ### Charge Resolution Columns (K2 -> K1 copy)
 
@@ -548,8 +559,8 @@ After charge lookup, these fields are copied from the K2 lookup row into the K1 
 | 104 | 5 | Project code |
 | 108 | 24 | Combined code+payType (e.g., ZLEAVE.FTBRHB) |
 | 112 | 26 | Flag |
-| 376 | 15 | Pay type |
-| 400 | 32 | Project code |
+| 376 -> 377 | 15 | Pay type (UDT10_ID_U2_CHG_LKUP) |
+| 400 -> 401 | 32 | Project code (UDT02_DISPLAY) |
 
 ### Source Code Columns
 
@@ -683,10 +694,10 @@ The full init sequence from cold start:
    → Login info handshake
 
 8. POST MasterServlet.cps  [507 + 101 OPEN_APP + 507]
-   → Open application, save response for checkCache
+   → Open application
 
 9. POST MasterServlet.cps  [201 OPEN_RS K0 + 507]
-   → Open parent record set (TMMTS), save response for checkCache
+   → Open parent record set (TMMTS)
 
 10. POST MasterServlet.cps  [204 K0+ + 204 K0- + 201 OPEN_RS K1 + 507]
     → Fetch parent data + open child record set (TMMTS_TS_LINE)
@@ -747,14 +758,26 @@ Batch: [205 PUT K0 + 205 PUT K1 + 206 SAVE + 204 K0+ + 204 K0- + 204 K1+ + 204 K
 
 ### Sign
 
-Signing is done by setting ACTION_CD and saving:
+Browser capture `captured/sign-capture/017+018` (active week). In the browser, Sign first shows a `confirm()` certification text; no request is sent until it is accepted.
 
 ```
-1. Set parentData.rows[0][667] = "S"  (ACTION_CD column)
-2. Execute normal save flow
+1. [205 PUT K0 (rsRowSelectedFlOnly, C=0, editFlag=64)        parent as-is
+    205 PUT K0 (C=0, editFlag=82)                              ACTION_CD (col 23) = "S"
+    205 PUT K0 (rsContextOnly, C=0, editFlag=82)               ACTION_CD = "S"
+    205 PUT K1 row 0 (X=0, rsContextOnly, C=0, editFlag=0)
+    300 TMMTS_SIGN_TIMESHEET (action boilerplate, C=0, K=0),
+    204 K0 x2, 204 K1 x2, 507] + &reqIdx=1
+   → Response parent row carries ACTION_CD="S"
+
+2. [205 PUT K0 (C=0, editFlag=18)                              row from step 1
+    206 SAVE (C=0),
+    204 K0 x2, 204 K0 (R=S&C, W=''), 204 K1 x2, 204 K1 (R=S&C, X=0, W=''), 507]
+   → No K1 PUT. Status becomes S.
 ```
 
-The server interprets ACTION_CD="S" as a sign request.
+Setting ACTION_CD and running a plain save is not enough: without the CMD 300 the server ignores ACTION_CD="S". The active-week confirm returns no 204 data, so the client re-fetches and checks the status. `ENABLE_SIGN_FL` is N once a week is signed; CMD 300 on such a week fails with "You do not have rights to execute this process".
+
+Sign on a fresh session (launch → sign, or launch → select period → sign). On a session that has already edited and saved, the whole flow round-trips as success but the timesheet stays Open (see CLAUDE.md).
 
 ### Add Project Line
 
@@ -764,10 +787,10 @@ Full 5-step flow for adding a new timesheet line:
 
 ```
 Local preparation:
-  - new Array(402).fill('')
-  - Copy template cols (0, 150, 151, 187, 193, 194, 197, 234, 235, 336, 398) from existing row
+  - new Array(row width).fill('')
+  - Copy the template columns (see Template Columns) from an existing row
   - Set col[1] = col[198] = next sequence number
-  - Set col[196] = col[393] = "N"
+  - Set col[196] (IS_AMBIGUOUS_LKP) = UDT_FROM_LKP_FL = "N"
   - Append to childData with rowNum=-59999, rowFlag=19
 
 Batch: [205 PUT K0 + 205 PUT K1 + 205 PUT K0 ctx + 205 PUT K1 ctx + 300 TMMTS_NEW_TS_LINE + 204 K0+ + 204 K0- + 204 K1+ + 204 K1- + 507]
@@ -807,6 +830,24 @@ is not committed, causing "Account required" on save.
 #### Step 5: Save
 
 Normal save flow with editFlag=19 for the new row.
+
+#### Optional: Add to Favorites (between Step 4 and Step 5)
+
+CMD 300 `TMMTS_ADD_LINE_TO_FAVORITES` on the pending row (capture `add-favorite/` request 024, `DirectClient.addToFavorites()`). Same shape as NEW_TS_LINE, with these differences:
+
+```
+Batch: [205 PUT K1 rsRowSelectedFlOnly (editFlag 83, no lastPutId)
+      + 205 PUT K1 (83) + 205 PUT K0 ctx (editFlag 65562)
+      + 205 PUT K1 ctx (83) + 300 action + 204 K0+ + 204 K0-
+      + 204 K1+ + 204 K1- (cursor C=-59999) + 507]
+  + &reqIdx=2
+
+  - actionId: TMMTS_ADD_LINE_TO_FAVORITES
+  - procUniqueId: TMMTIMESHEET:A:{sid}:2 (second action in the session)
+  - 204 K0+ has no nonDBSize/nonDBStart
+```
+
+The response is all `<OK>` with no message text. Not captured: the action on an already-saved row.
 
 ### Multi-Charge Resolution
 
@@ -848,8 +889,8 @@ Before sending CMD 300, copy fields from selected K2 row to K1 child row:
 K1[104] ← K2[5]    (project code)
 K1[108] ← K2[24]   (combined code+payType)
 K1[112] ← K2[26]   (flag)
-K1[376] ← K2[15]   (pay type)
-K1[400] ← K2[32]   (project code)
+K1[UDT10_ID_U2_CHG_LKUP] ← K2[15]   (pay type; 376 captures, 377 live)
+K1[UDT02_DISPLAY] ← K2[32]   (project code; 400 captures, 401 live)
 ```
 
 Then send the 14-command batch:
@@ -924,45 +965,84 @@ CMD 206 SAVE returns result code `-1` in rescds. `checkErrors()` may or may not 
 
 ### Previous Period Fetch
 
-For biweekly pay periods, fetching the other week requires re-establishing the app state to avoid server cache conflicts:
+Parent K0 holds one row per period (newest first): row 0 is the active week, row 1 the previous week. Child lines for a period are fetched with `X` = that parent row index. The browser's previous-week arrow sends just the X=1 fetch (`captured/prev-period-edit/013`), but it relies on the `R=AUTO` parent fetch the browser makes during init (`009`):
 
 ```
-1. Re-open app with checkCache (Java String.hashCode() of previous OPEN_APP response)
-   → [507 + 101 OPEN_APP (checkCache=hash) + 507]
+1. [204 K0 (rsType=M, R=AUTO, X=0, W=$N$|1:20|0|, K=0, C=0)] + &autocompletefl=Y
+   → Response slot 5 carries parent rows 1-20 in full
+   → Loads those rows server-side; without it, step 2 answers X=1 with the
+     wrong (empty) lines and K0 rows past 0 stay sparse
 
-2. JSON POST: getHistoryData for TMMTS
-   → {"ProcIdSeed": sid, "requests": [{"getHistoryData": {"appId": "TMMTIMESHEET", "rsId": "TMMTS", "rsKeyLkpHist": -1}}]}
-
-3. Re-open parent RS with checkCache (hash of previous OPEN_RS response)
-   → [201 OPEN_RS K0 (checkCache=hash) + 507]
-
-4. JSON POST: getHistoryData for TMMTS_TS_LINE
-
-5. Re-fetch parent data + open child RS (same as init step 10)
-
-6. Autocomplete fetch (rsType=M, R=AUTO, W=$N$|1:20|0|)
-
-7. Fetch X=0 child data (re-prime)
-
-8. CMD 221 message fetch (metaData=TC_UNSAVED_DATA,#TM_APPROVE_TEXT,...)
-
-9. Finally: Fetch X=1 child data
-   → [204 K1+ (X=1) + 204 K1- (X=1) + 507]
-   → nonDBSize=9, nonDBStart=0 on positive range
+2. [204 K0+ (C=1, nonDBSize=1) + 204 K1+ (X=1, C=-60000, nonDBSize=9)
+    + 204 K1- (X=1) + 507]
+   → K0 row 1 now has its detail columns; K1 is the previous week's lines
 ```
 
-The `checkCache` parameter uses Java's `String.hashCode()`:
+Verified live 2026-09-28 (`captured/probe-prev-fetch.js`): step 2 without step 1 returned the active week's empty line; with step 1 it returned the previous week's hours. An older implementation re-ran OPEN_APP/OPEN_RS with `checkCache` hashes, getHistoryData and CMD 221 before the X=1 fetch; the AUTO fetch was the step that mattered.
 
-```javascript
-function javaHashCode(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return hash;
-}
+### Previous Period Edit
+
+Browser capture `captured/prev-period-edit/013-024`: previous week (processed), Correct, edit Friday, save, revision explanation.
+
+The period index goes in two places on every command that touches the period:
+
+| Command | Parameter | Active week | Previous week |
+|---------|-----------|-------------|---------------|
+| 205 PUT K0, 206 SAVE, 204 K0 | `C` (K0 cursor) | 0 | 1 |
+| 205 PUT K0 | `rowNumber` | rowNums[0] | rowNums[1] |
+| 205/208/204 K1 | `X` (parent row) | 0 | 1 |
+| 201/204/205 K2 revision | `X` | 0 | 1 |
+| 300 Correct / Sign | `C` | 0 | 1 |
+| 300 `TMMTS_NEW_TS_LINE` | `C` (pending row), K0 PUT `C`/`rowNumber` | -59999, 0 | -59999, 1 |
+| 205/208/204 K1 add, validate, lookup-OK | `X` | 0 | 1 |
+| 205 K0 context PUT in lookup-OK | `C` | 0 | 1 |
+
+K1 `C` stays the child row cursor (0). K3 audit `X` stays 0 (it indexes K2). The K1 `R=S&C` fetch in the sign confirm stays `X=0` as well.
+
+**Correct** (only when `TS_CLOSED_FL`=Y; needs `ENABLE_CORRECT_FL`=Y):
+
 ```
+1. [205 PUT K0 (rsRowSelectedFlOnly, C=1, editFlag=64, rowNumber=1),
+    205 PUT K0 (rsContextOnly, C=1, editFlag=64),
+    205 PUT K1 row 0 (X=1, rsContextOnly, C=0, editFlag=0),
+    300 TMMTS_CORRECT_TIMESHEET (action boilerplate, C=1, K=0),
+    204 K0 (C=1) x2, 204 K1 (X=1) x2, 507] + &reqIdx=1
+
+2. [205 PUT K0 (C=1, editFlag=82, rowNumber=1), 206 SAVE (C=1),
+    204 K0 x2, 204 K0 (R=S&C, C=1), 204 K1 x2, 204 K1 (R=S&C, X=0), 507]
+   → Status becomes O, REVISION_NO +1, CORRECTION_STATE=INP, TS_CLOSED_FL=N
+```
+
+A live correction (2026-10-13) committed while the save response still showed `TS_CLOSED_FL`=Y. That save lacked the two `R=S&C` fetches. The client now sends them and re-fetches the period before reporting the correction as failed.
+
+The corrected week is Open afterwards and has to be signed again (**Sign** below).
+
+**Cell edit:** same as the active week with `X=1` on the 205/208 and the refreshes on `C=1` / `X=1`.
+
+**Save:** `[205 PUT K0 (C=1, editFlag=18, rowNumber=1), 205 PUT K1 (X=1), 206 SAVE (C=1), 204 refreshes, 507]`. The parent editFlag is 18, as in the browser; the active-week save still sends 65562. On a corrected week the 206 returns -1 "Explanation or Reject Reason is required."
+
+**Revision explanation:** the normal flow with `X=1` on OPEN_RS K2, the K2 query and the three K2 PUTs, and `C=1` on the 206.
+
+**Sign** (browser capture `captured/prev-period-sign/014+015`, previous week Open after a correction): the [Sign](#sign) flow with the period in every slot of the table above. Step 1 PUTs parent row 1 on `C=1` (editFlags 64/82/82) and K1 row 0 on `X=1`, and the 300 carries `C=1`. Step 2 PUTs parent row 1 with editFlag 18, saves on `C=1` and fetches K0 `R=S&C` on `C=1`, while the K1 `R=S&C` fetch keeps `X=0`. Unlike the active week, the confirm response carries 204 K0/K1 data with the new status S. After the sign, row 1 has `ENABLE_SIGN_FL`=N.
+
+**Add / favorites** (browser capture `captured/past-week-add/014-023`, Signed and not closed past week, nothing saved): the active-week flows with the period in every slot of the table above. `TMMTS_NEW_TS_LINE` PUTs parent row 1 on `C=1` and the pending K1 row on `X=1`; the favorites primer, favorites HLKP and K2 PUTs keep their K2 cursors; the lookup-OK K1 PUTs and refreshes carry `X=1` and its K0 context PUT uses `C=1`. No request is needed before the add on a Signed week. A closed week is corrected first. Discarding a pending line is CMD 209 on `K1 C-59999` (capture 020, a line that already had a charge); the next pending row is numbered -59998. Live Costpoint validates the line first: on an uncharged line the 209 fails with "One or more charge lines were invalid and could not be added to timesheet because certain required values were invalid or could not be calculated." plus "The following field is required: |UDT10_ID|." (verified 2026-10-26, also with the K2 lookup closed by CMD 215 first).
+
+**Favorites** (capture 015-018), identical on every period apart from the `X=1` PUTs in the pick:
+
+```
+1. [201 OPEN_RS K2 ITC_UDT02_CHARGE_LKP (C=-60000, P=1, objectId=UDT02_ID), 507]
+2. [204 HLKP K2 (X=-59999, C=-60000, W=LVL 1, ROW -1) + 204 HLKP newQry, 507]   categories primer
+3. [204 HLKP K2 (X=-59999, C=0, W=LVL 2, ROW 0), 507]                           favorites list
+4. pick: lookup-OK batch (TC_TS_CHARGE_LKP_OK, K2 C=<row>), see Add Project Line
+```
+
+Without step 2, step 3 returns `<NO DATA>`. The lookup needs a pending K1 row first, so `getFavorites()` stages one and runs `TMMTS_NEW_TS_LINE` when none exists. That row cannot be deleted (the 209 above refuses an uncharged line), so a plain listing runs on a throwaway session that is closed afterwards (`listFavorites()` in `session.js`, CLI `te favorites`); nothing is written. The mock refuses the 209 the same way.
+
+**Typed code** (capture 022-023): `204 RAUTO X=-59999` on `TC_UDT02_CHARGE_LKP` (K1 `C=-59999`), then a K1 PUT of the pending row (`X=1 C-59998`) with the code in the data, then `208 UDT02_ID`. There is no OPEN_RS K2 and no HLKP. `add()` does not follow this: it always runs the OPEN_RS K2 resolve flow so it has the K2 row to commit CHARGE_ID. The divergence is unverified live on a past week.
+
+**Fetch bounds:** the browser's arrow fetches and K1 refreshes send `E45` for K1 and `S-59999 E-59954` for its partner. `_buildPeriodFetch()` sends `E40` and `E-59959`, and also repeats the K0 fetch, which the browser's arrow does not. The current fetch is verified live, so it is unchanged (`test/prev-period.test.js` pins both shapes). The bounds only matter for weeks with more than 40 lines.
+
+**Reach:** the browser arrows back to at least X=41 by paging K0 (`S20 E40 K0 C19`, then `S40 E60 K0 C39`) and sending only the K1 fetch pair for the older week. The client does not page K0, so `getPeriods()` and `selectPeriod()` stop at the rows the init fetch loads (about 20). Going further also needs every later K0 refresh to keep the older row loaded. Fetches for X=2 and X=3 are the same pair as X=1 with the index swapped (capture 024, 025).
 
 ---
 
@@ -1018,6 +1098,13 @@ The initial GET to `cploginform.htm` returns a 302 redirect to an external hostn
 1. GET {samlUrl}
    → Extract stateToken from HTML/JS: "stateToken":"..."
    → Decode JS escapes (\x2D → '-')
+   → Since 2026-10 the SAML URL lands on the desktop-SSO interstitial
+     /sso/idps/DSSO ("One moment please..."), which carries
+     `var stateToken = "..."` and runs a Kerberos precheck. Off the corporate
+     network the browser takes the precheck failure redirect:
+     GET /login/agentlessDsso/idx?stateToken=…&precheckFailure=true&redirectFromAdsso=true
+     That is the Sign-In page with its own JSON "stateToken" (a different
+     token); step 2 uses it
 
 2. POST /idp/idx/introspect  (JSON: { stateToken })
    → Returns { stateHandle }
@@ -1086,7 +1173,7 @@ Many batches include "context" PUTs (`rsContextOnly=Y`) in addition to regular P
 
 CMD 300 actions need `&reqIdx=N` appended to the POST body (not URL-encoded in the main fields). This tells the server which record set key is the action context:
 
-- `reqIdx=1` — K1 (child), used for TMMTS_NEW_TS_LINE
+- `reqIdx=1` — used for TMMTS_NEW_TS_LINE (K1), TMMTS_SIGN_TIMESHEET and TMMTS_CORRECT_TIMESHEET
 - `reqIdx=2` — K2 (lookup), used for TC_TS_CHARGE_LKP_OK
 
 Without this, the server ignores the K2 row selection in charge lookups.
